@@ -1,0 +1,33 @@
+# Solana SDK
+solana>=0.36.0
+solders>=0.21.0
+
+# HTTP Requests
+httpx>=0.27.0
+aiohttp>=3.9.0
+
+# Telegram Bot
+python-telegram-bot>=22.0
+
+# Configuration
+pyyaml>=6.0.1
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# Async utilities
+asyncio-throttle>=1.0.2
+
+# Base58 encoding
+base58>=2.1.1
+
+# Logging
+structlog>=24.1.0
+
+# GUI Dashboard
+customtkinter>=5.2.0
+pillow>=10.0.0
+
+# Development
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
