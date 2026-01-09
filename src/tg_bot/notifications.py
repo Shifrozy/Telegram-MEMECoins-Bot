@@ -15,7 +15,11 @@ from src.trading.models import TradeResult, TradeStatus
 from src.tracking.wallet_tracker import WalletActivity
 from src.tracking.copy_trader import CopyTradeDecision
 from src.blockchain.transaction import SwapInfo, SwapDirection, format_swap_message, TransactionParser
-from src.tg_bot.keyboards import build_main_menu
+from src.tg_bot.keyboards import (
+    build_main_menu, 
+    build_wallet_setup_menu,
+    build_main_trading_menu,
+)
 
 logger = get_logger(__name__)
 
@@ -288,23 +292,19 @@ Change: {change:+.6f}
         sol_balance: float,
     ) -> None:
         """
-        Send bot startup confirmation with menu buttons.
-        
-        Args:
-            wallet_address: Bot's wallet address
-            sol_balance: Current SOL balance
+        Send simple startup message with trading menu.
         """
         message = f"""
-🚀 **Solana Trading Bot Started**
-
-**Wallet:** `{wallet_address[:8]}...{wallet_address[-4:]}`
-**Balance:** {sol_balance:.4f} SOL
-**Network:** {self.settings.network}
-
-⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+🚀 **Solana Trading Bot**
 
 ━━━━━━━━━━━━━━━━━━━━
-**Select an option below:**
+
+💼 Wallet: `{wallet_address[:6]}...{wallet_address[-4:]}`
+💰 Balance: **{sol_balance:.4f} SOL**
+
+━━━━━━━━━━━━━━━━━━━━
+
+Paste any token address to trade instantly!
 """
         
         try:
@@ -312,11 +312,102 @@ Change: {change:+.6f}
                 chat_id=self.chat_id,
                 text=message.strip(),
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=build_main_menu(),
+                reply_markup=build_main_trading_menu(),
             )
         except TelegramError as e:
             logger.error("startup_message_error", error=str(e))
-            # Fallback without buttons
+            await self.send_message(message.strip())
+    
+    async def send_new_user_welcome(self) -> None:
+        """
+        Send welcome message to new users without a wallet.
+        Prompts them to generate or import a wallet - Trojan/BonkBot style.
+        """
+        message = """
+🚀 **Welcome to Solana Trading Bot!**
+
+The fastest way to trade memecoins on Solana! 🎉
+
+━━━━━━━━━━━━━━━━━━━━
+
+**✨ Features:**
+🟢 **Instant Buy/Sell** - Trade any token in seconds
+📋 **Copy Trading** - Mirror successful traders
+📊 **Limit Orders** - Set buy/sell price targets
+📈 **Portfolio Tracking** - Monitor your holdings
+🔔 **Price Alerts** - Get notified on price moves
+
+━━━━━━━━━━━━━━━━━━━━
+
+**🔐 To get started, you need a trading wallet!**
+
+Choose an option below:
+
+🆕 **Generate New** - Create a fresh wallet (recommended)
+📥 **Import Existing** - Use your own private key
+"""
+        
+        try:
+            await self.bot.send_message(
+                chat_id=self.chat_id,
+                text=message.strip(),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=build_wallet_setup_menu(),
+            )
+        except TelegramError as e:
+            logger.error("welcome_message_error", error=str(e))
+            await self.send_message(message.strip())
+    
+    async def send_wallet_created_message(
+        self,
+        wallet_address: str,
+        is_imported: bool = False,
+    ) -> None:
+        """
+        Send wallet created/imported confirmation.
+        
+        Args:
+            wallet_address: The new wallet address
+            is_imported: Whether wallet was imported
+        """
+        action = "Imported" if is_imported else "Created"
+        
+        message = f"""
+✅ **Wallet {action} Successfully!**
+
+━━━━━━━━━━━━━━━━━━━━
+
+**📍 Your Wallet Address:**
+`{wallet_address}`
+
+━━━━━━━━━━━━━━━━━━━━
+
+**⚠️ IMPORTANT - Backup Your Wallet!**
+
+1. Click "🔑 Export Key" in wallet menu
+2. Save your private key in a secure place
+3. Never share your private key with anyone!
+
+━━━━━━━━━━━━━━━━━━━━
+
+**💰 Next Steps:**
+
+1. **Deposit SOL** to your wallet address above
+2. Once funded, you can start trading!
+3. Paste any token address to buy instantly
+
+Ready to trade? Click a button below! 👇
+"""
+        
+        try:
+            await self.bot.send_message(
+                chat_id=self.chat_id,
+                text=message.strip(),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=build_main_trading_menu(),
+            )
+        except TelegramError as e:
+            logger.error("wallet_created_message_error", error=str(e))
             await self.send_message(message.strip())
     
     async def send_shutdown_message(self) -> None:

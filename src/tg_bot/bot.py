@@ -1,5 +1,6 @@
 """
 Main Telegram bot implementation.
+Simplified and enhanced with auto-trading features.
 """
 
 import asyncio
@@ -217,15 +218,18 @@ class TelegramBot:
             TelegramCommandHandler("slippage", self._cmd_handler.cmd_slippage)
         )
         
-        # Limit orders
+        # New Trading Settings Commands
         self._app.add_handler(
-            TelegramCommandHandler("limit", self._cmd_handler.cmd_limit)
+            TelegramCommandHandler("tp", self._cmd_handler.cmd_tp)
         )
         self._app.add_handler(
-            TelegramCommandHandler("orders", self._cmd_handler.cmd_orders)
+            TelegramCommandHandler("sl", self._cmd_handler.cmd_sl)
         )
         self._app.add_handler(
-            TelegramCommandHandler("cancelorder", self._cmd_handler.cmd_cancelorder)
+            TelegramCommandHandler("amount", self._cmd_handler.cmd_amount)
+        )
+        self._app.add_handler(
+            TelegramCommandHandler("positions", self._cmd_handler.cmd_positions)
         )
         
         # Interactive menu command
@@ -238,6 +242,14 @@ class TelegramBot:
             self._app.add_handler(
                 CallbackQueryHandler(self._callback_handler.handle_callback)
             )
+        
+        # Message handler for text input (wallet addresses, token URLs, etc.)
+        self._app.add_handler(
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                self._handle_text_message
+            )
+        )
         
         # Error handler
         self._app.add_error_handler(self._error_handler)
@@ -330,6 +342,25 @@ Welcome! Select an option below:
         """Send a message to the admin."""
         if self.notifications:
             await self.notifications.send_message(text)
+    
+    async def _handle_text_message(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle text messages (wallet addresses, token URLs, etc.)."""
+        # Only process messages from admin
+        if update.effective_user.id != self.settings.telegram_admin_id:
+            return
+        
+        # Let callback handler process the message
+        if self._callback_handler:
+            handled = await self._callback_handler.process_text_message(update, context)
+            if handled:
+                return
+        
+        # If not handled, could send a hint message
+        # (but let's not be too noisy - only show hint if it looks like they tried to paste something)
 
 
 async def create_telegram_bot(

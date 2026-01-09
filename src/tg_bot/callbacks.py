@@ -1,5 +1,6 @@
 """
 Callback query handlers for inline button interactions.
+Simplified and enhanced with auto-trading features.
 """
 
 from datetime import datetime
@@ -13,6 +14,9 @@ from src.config.settings import Settings
 from src.blockchain.client import SolanaClient
 from src.blockchain.wallet import WalletManager
 from src.trading.executor import TradeExecutor
+from src.trading.token_info import TokenInfoService
+from src.trading.position_manager import PositionManager
+from src.trading.user_settings import UserSettingsManager
 from src.tracking.wallet_tracker import WalletTracker
 from src.tracking.copy_trader import CopyTrader
 from src.tracking.pnl_tracker import PnLTracker
@@ -20,15 +24,24 @@ from src.tracking.wallet_analyzer import WalletAnalyzer
 from src.tg_bot.keyboards import (
     build_main_menu,
     build_back_button,
-    build_trading_menu,
-    build_quick_buy_amounts,
-    build_quick_sell_percentages,
-    build_wallet_menu,
-    build_wallet_actions,
     build_settings_menu,
     build_slippage_options,
-    build_network_menu,
+    build_wallet_menu,
+    build_positions_menu,
+    build_position_detail_menu,
+    build_buy_menu,
+    build_buy_confirm_menu,
+    build_sell_menu,
+    build_token_action_menu,
+    build_buy_amount_options,
+    build_tp_options,
+    build_sl_options,
+    build_copy_trade_menu,
+    build_tracked_wallets_menu,
+    build_confirm_cancel,
 )
+from src.tg_bot.wallet_connection import WalletConnectionManager, TokenExtractor
+from src.tg_bot.user_wallet_manager import UserWalletManager
 
 logger = get_logger(__name__)
 
@@ -36,6 +49,7 @@ logger = get_logger(__name__)
 class CallbackHandler:
     """
     Handles callback queries from inline keyboard buttons.
+    Simplified with focus on trading, positions, and settings.
     """
     
     def __init__(
@@ -58,11 +72,19 @@ class CallbackHandler:
         
         self.admin_id = settings.telegram_admin_id
         
-        # Store pending actions (user_id -> action data)
-        self._pending_actions: Dict[int, Dict[str, Any]] = {}
+        # Pending actions (user_id -> action data)
+        self._pending: Dict[int, Dict[str, Any]] = {}
         
-        # Wallet analyzer for historical data
+        # Services
         self._wallet_analyzer = WalletAnalyzer(solana)
+        self._wallet_connection = WalletConnectionManager()
+        self._user_wallets = UserWalletManager()
+        self._token_service = TokenInfoService()
+        self._user_settings = UserSettingsManager()
+        self._position_manager = PositionManager(
+            token_service=self._token_service,
+            executor=executor,
+        )
     
     def _is_admin(self, user_id: int) -> bool:
         """Check if user is admin."""
@@ -75,120 +97,161 @@ class CallbackHandler:
     ) -> None:
         """Main callback handler - routes to specific handlers."""
         query = update.callback_query
-        await query.answer()  # Acknowledge the callback
+        await query.answer()
         
         if not self._is_admin(query.from_user.id):
             await query.edit_message_text("⛔ Unauthorized")
             return
         
         data = query.data
+        user_id = query.from_user.id
         
         try:
-            # Route to appropriate handler
+            # ==========================================
+            # MAIN MENU
+            # ==========================================
             if data == "menu_main":
                 await self._show_main_menu(query)
-            elif data == "menu_balance":
+            elif data == "menu_refresh":
+                await self._show_main_menu(query)
+            
+            # ==========================================
+            # TRADING
+            # ==========================================
+            elif data == "trade_buy":
+                await self._show_buy_prompt(query)
+            elif data == "trade_sell":
+                await self._show_sell_prompt(query)
+            elif data.startswith("buy_exec_"):
+                await self._handle_buy_exec(query, data)
+            elif data.startswith("buy_confirm_"):
+                await self._handle_buy_confirm(query, data)
+            elif data.startswith("sell_exec_"):
+                await self._handle_sell_exec(query, data)
+            elif data.startswith("qbuy_"):
+                await self._handle_quick_buy(query, data)
+            elif data.startswith("qsell_"):
+                await self._handle_quick_sell(query, data)
+            elif data.startswith("token_refresh_"):
+                await self._refresh_token_info(query, data)
+            
+            # ==========================================
+            # POSITIONS
+            # ==========================================
+            elif data == "menu_positions":
+                await self._show_positions(query)
+            elif data.startswith("pos_view_"):
+                await self._show_position_detail(query, data)
+            elif data.startswith("pos_tp_"):
+                await self._show_tp_options_for_position(query, data)
+            elif data.startswith("pos_sl_"):
+                await self._show_sl_options_for_position(query, data)
+            elif data.startswith("pos_close_"):
+                await self._close_position(query, data)
+            
+            # ==========================================
+            # WALLET
+            # ==========================================
+            elif data == "wallet_manage":
+                await self._show_wallet_menu(query)
+            elif data == "wallet_balance":
                 await self._show_balance(query)
-            elif data == "menu_portfolio":
-                await self._show_portfolio(query)
-            elif data == "menu_buy":
-                await self._show_buy_menu(query)
-            elif data == "menu_sell":
-                await self._show_sell_menu(query)
-            elif data == "menu_wallets":
-                await self._show_wallets_menu(query)
-            elif data == "menu_activity":
-                await self._show_activity(query)
-            elif data == "menu_copy":
-                await self._show_copy_status(query)
-            elif data == "menu_pnl":
-                await self._show_pnl(query)
+            elif data == "wallet_deposit":
+                await self._show_deposit_info(query)
+            elif data == "wallet_withdraw":
+                await self._show_withdraw_prompt(query)
+            elif data == "wallet_export":
+                await self._show_export_warning(query)
+            elif data == "wallet_generate":
+                await self._generate_wallet(query)
+            elif data == "wallet_import":
+                await self._show_import_prompt(query)
+            
+            # ==========================================
+            # SETTINGS
+            # ==========================================
             elif data == "menu_settings":
                 await self._show_settings(query)
-            elif data == "menu_status":
-                await self._show_status(query)
-            
-            # Buy amount handlers
-            elif data.startswith("buy_"):
-                await self._handle_buy_amount(query, data)
-            
-            # Sell percentage handlers
-            elif data.startswith("sell_"):
-                await self._handle_sell_percentage(query, data)
-            
-            # Wallet handlers
-            elif data.startswith("wallet_"):
-                await self._handle_wallet_action(query, data)
-            elif data.startswith("wact_"):
-                await self._show_wallet_activity(query, data[5:])
-            elif data.startswith("wpnl_"):
-                await self._show_wallet_pnl(query, data[5:])
-            elif data.startswith("wremove_"):
-                await self._remove_wallet(query, data[8:])
-            elif data.startswith("wstats_"):
-                await self._show_wallet_stats(query, data[7:])
-            
-            # Settings handlers
+            elif data == "set_buy_amount":
+                await self._show_buy_amount_options(query)
+            elif data == "set_tp":
+                await self._show_tp_options(query)
+            elif data == "set_sl":
+                await self._show_sl_options(query)
             elif data == "set_slippage":
                 await self._show_slippage_options(query)
-            elif data.startswith("slip_"):
+            elif data == "set_auto_confirm":
+                await self._toggle_auto_confirm(query)
+            elif data.startswith("setamt_"):
+                await self._set_buy_amount(query, data)
+            elif data.startswith("settp_"):
+                await self._set_tp(query, data)
+            elif data.startswith("setsl_"):
+                await self._set_sl(query, data)
+            elif data.startswith("setslip_"):
                 await self._set_slippage(query, data)
-            elif data == "set_network":
-                await self._show_network_options(query)
-            elif data.startswith("network_"):
-                await self._set_network(query, data)
-            elif data == "set_copy":
-                await self._show_copy_settings(query)
-            elif data == "set_alerts":
-                await self._show_alerts_settings(query)
-            elif data == "set_amount":
-                await self._show_amount_settings(query)
-            elif data == "set_risk":
-                await self._show_risk_settings(query)
+            
+            # ==========================================
+            # COPY TRADING
+            # ==========================================
+            elif data == "menu_copy":
+                await self._show_copy_status(query)
             elif data == "copy_enable":
                 await self._enable_copy_trading(query)
             elif data == "copy_disable":
                 await self._disable_copy_trading(query)
+            elif data == "copy_add_wallet":
+                await self._show_add_wallet_prompt(query)
+            elif data == "copy_view_wallets":
+                await self._show_tracked_wallets(query)
+            elif data.startswith("copy_wallet_"):
+                await self._show_wallet_detail(query, data)
+            elif data.startswith("copy_remove_"):
+                await self._remove_tracked_wallet(query, data)
             
-            # Follow/unfollow
-            elif data.startswith("follow_"):
-                await self._follow_wallet(query, data[7:])
-            elif data.startswith("unfollow_"):
-                await self._unfollow_wallet(query, data[9:])
-            
-            # No-op for info buttons
+            # ==========================================
+            # NO-OP
+            # ==========================================
             elif data == "noop":
                 pass
-            
             else:
-                await query.edit_message_text(
-                    f"Unknown action: {data}",
-                    reply_markup=build_back_button(),
-                )
+                logger.warning("unknown_callback", data=data)
                 
         except Exception as e:
             logger.error("callback_error", error=str(e), data=data)
             await query.edit_message_text(
-                f"Error: {str(e)[:100]}",
+                f"❌ Error: {str(e)[:100]}",
                 reply_markup=build_back_button(),
             )
     
+    # ==========================================
+    # MAIN MENU HANDLERS
+    # ==========================================
+    
     async def _show_main_menu(self, query) -> None:
         """Show main menu."""
-        message = """
-🤖 **Solana Trading Bot**
+        user_id = query.from_user.id
+        user_settings = self._user_settings.get_settings(user_id)
+        
+        try:
+            sol_balance = await self.solana.get_balance(self.wallet.address)
+        except:
+            sol_balance = 0.0
+        
+        open_positions = len(self._position_manager.get_all_positions(open_only=True))
+        
+        message = f"""
+🚀 **Solana Trading Bot**
 
-Welcome! Select an option below:
+💰 **Balance:** {sol_balance:.4f} SOL
+📊 **Open Positions:** {open_positions}
 
-💰 **Balance** - Check wallet balance
-📊 **Portfolio** - View your holdings
-🟢🔴 **Buy/Sell** - Execute trades
-👛 **Wallets** - Manage tracked wallets
-📋 **Activity** - Recent swap activity
-📑 **Copy Trade** - Auto-copy settings
-📈 **PnL** - Profit & Loss report
-⚙️ **Settings** - Bot configuration
-🔄 **Status** - System health
+**Settings:**
+• Amount: {user_settings.default_buy_amount_sol} SOL
+• TP: {user_settings.take_profit_pct}%
+• SL: {user_settings.stop_loss_pct}%
+
+Select an option:
 """
         await query.edit_message_text(
             message.strip(),
@@ -196,162 +259,52 @@ Welcome! Select an option below:
             parse_mode="Markdown",
         )
     
-    async def _show_balance(self, query) -> None:
-        """Show wallet balance."""
-        try:
-            sol_balance = await self.solana.get_balance(self.wallet.address)
-            
-            message = f"""
-💰 **Wallet Balance**
-
-**Address:** 
-`{self.wallet.address}`
-
-**SOL Balance:** {sol_balance:.4f} SOL
-
-🔗 [View on Solscan](https://solscan.io/account/{self.wallet.address})
-"""
-            await query.edit_message_text(
-                message.strip(),
-                reply_markup=build_back_button(),
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            await query.edit_message_text(
-                f"Error fetching balance: {e}",
-                reply_markup=build_back_button(),
-            )
+    # ==========================================
+    # TRADING HANDLERS
+    # ==========================================
     
-    async def _show_portfolio(self, query) -> None:
-        """Show portfolio dashboard."""
-        try:
-            sol_balance = await self.solana.get_balance(self.wallet.address)
-            
-            # Get token balances (placeholder for now)
-            message = f"""
-📊 **Portfolio Dashboard**
+    async def _show_buy_prompt(self, query) -> None:
+        """Prompt user for token address to buy."""
+        user_id = query.from_user.id
+        settings = self._user_settings.get_settings(user_id)
+        
+        self._pending[user_id] = {"action": "buy"}
+        
+        message = f"""
+🟢 **Buy Token**
 
-**Total Value:** ~{sol_balance:.2f} SOL
+Current Settings:
+• Amount: **{settings.default_buy_amount_sol} SOL**
+• TP: {settings.take_profit_pct}% | SL: {settings.stop_loss_pct}%
 
 ━━━━━━━━━━━━━━━━━━━━
-**Holdings:**
 
-💎 **SOL** 
-   {sol_balance:.4f} SOL
+📝 **Now paste the token address:**
 
-_Token balances coming soon..._
-━━━━━━━━━━━━━━━━━━━━
-
-🔗 [View Full Portfolio](https://solscan.io/account/{self.wallet.address})
-"""
-            await query.edit_message_text(
-                message.strip(),
-                reply_markup=build_back_button(),
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            await query.edit_message_text(
-                f"Error: {e}",
-                reply_markup=build_back_button(),
-            )
-    
-    async def _show_buy_menu(self, query) -> None:
-        """Show buy amount selection."""
-        message = """
-🟢 **Quick Buy**
-
-Select amount of SOL to spend:
-
-_Paste a token address after selecting amount_
+_Or paste a DEX Screener/Pump.fun link_
 """
         await query.edit_message_text(
             message.strip(),
-            reply_markup=build_quick_buy_amounts(),
+            reply_markup=build_back_button(),
             parse_mode="Markdown",
         )
     
-    async def _show_sell_menu(self, query) -> None:
-        """Show sell percentage selection."""
-        message = """
-🔴 **Quick Sell**
-
-Select percentage to sell:
-
-_Choose a token from your portfolio_
-"""
-        await query.edit_message_text(
-            message.strip(),
-            reply_markup=build_quick_sell_percentages(),
-            parse_mode="Markdown",
-        )
-    
-    async def _show_wallets_menu(self, query) -> None:
-        """Show tracked wallets menu."""
-        if not self.tracker:
-            await query.edit_message_text(
-                "Wallet tracking not enabled.",
-                reply_markup=build_back_button(),
-            )
-            return
+    async def _show_sell_prompt(self, query) -> None:
+        """Prompt user for token address to sell."""
+        user_id = query.from_user.id
+        self._pending[user_id] = {"action": "sell"}
         
-        wallets = self.tracker.get_all_wallets()
+        # Show open positions
+        positions = self._position_manager.get_all_positions(open_only=True)
         
-        if not wallets:
-            message = """
-👛 **Tracked Wallets**
-
-No wallets being tracked yet.
-
-Use the button below to add a wallet,
-or send: `/track <address> <name>`
-"""
+        if positions:
+            message = "🔴 **Sell Token**\n\n**Open Positions:**\n\n"
+            for pos in positions[:5]:
+                pnl_emoji = "🟢" if pos.current_pnl_pct >= 0 else "🔴"
+                message += f"{pnl_emoji} **{pos.token_symbol}** ({pos.current_pnl_pct:+.1f}%)\n"
+            message += "\n📝 **Paste token address to sell:**"
         else:
-            message = f"""
-👛 **Tracked Wallets** ({len(wallets)})
-
-Select a wallet to view details:
-"""
-        
-        await query.edit_message_text(
-            message.strip(),
-            reply_markup=build_wallet_menu(wallets),
-            parse_mode="Markdown",
-        )
-    
-    async def _show_activity(self, query) -> None:
-        """Show recent activity."""
-        if not self.tracker:
-            await query.edit_message_text(
-                "Wallet tracking not enabled.",
-                reply_markup=build_back_button(),
-            )
-            return
-        
-        activities = self.tracker.get_recent_activities(limit=5)
-        
-        if not activities:
-            message = """
-📋 **Recent Activity**
-
-No activity detected yet.
-
-Track wallets to monitor their swaps.
-"""
-        else:
-            message = "📋 **Recent Activity**\n\n"
-            
-            for act in activities:
-                time = act.timestamp.strftime("%H:%M")
-                
-                if act.swap_info:
-                    swap = act.swap_info
-                    direction = "🟢" if swap.direction.value == "buy" else "🔴"
-                    message += (
-                        f"{direction} **{act.wallet_name}** ({time})\n"
-                        f"   {swap.input_amount:.4f} → {swap.output_amount:.4f}\n\n"
-                    )
-                else:
-                    message += f"⚪ **{act.wallet_name}** ({time})\n\n"
+            message = "🔴 **Sell Token**\n\n📝 Paste the token address to sell:"
         
         await query.edit_message_text(
             message.strip(),
@@ -359,650 +312,750 @@ Track wallets to monitor their swaps.
             parse_mode="Markdown",
         )
     
+    async def _handle_buy_exec(self, query, data: str) -> None:
+        """Handle buy execution with amount selection."""
+        # Format: buy_exec_{amount}_{token_prefix}
+        parts = data.replace("buy_exec_", "").split("_", 1)
+        amount_str = parts[0]
+        token_prefix = parts[1] if len(parts) > 1 else ""
+        
+        user_id = query.from_user.id
+        settings = self._user_settings.get_settings(user_id)
+        
+        if amount_str == "default":
+            amount = settings.default_buy_amount_sol
+        else:
+            amount = float(amount_str)
+        
+        # Get full token address from pending
+        pending = self._pending.get(user_id, {})
+        token_address = pending.get("token_address", "")
+        
+        if not token_address and token_prefix:
+            # Try to find in recent tokens
+            token_address = token_prefix  # Simplified for now
+        
+        if not token_address:
+            await query.edit_message_text(
+                "❌ Token address not found. Please try again.",
+                reply_markup=build_back_button(),
+            )
+            return
+        
+        # Execute buy
+        await self._execute_buy(query, token_address, amount, settings)
+    
+    async def _handle_buy_confirm(self, query, data: str) -> None:
+        """Handle confirmed buy execution."""
+        # Format: buy_confirm_{amount}_{token_prefix}
+        parts = data.replace("buy_confirm_", "").split("_", 1)
+        amount = float(parts[0])
+        token_prefix = parts[1] if len(parts) > 1 else ""
+        
+        user_id = query.from_user.id
+        settings = self._user_settings.get_settings(user_id)
+        pending = self._pending.get(user_id, {})
+        token_address = pending.get("token_address", token_prefix)
+        
+        await self._execute_buy(query, token_address, amount, settings)
+    
+    async def _execute_buy(self, query, token_address: str, amount: float, settings) -> None:
+        """Execute buy order."""
+        await query.edit_message_text(
+            f"🔄 **Executing Buy...**\n\n"
+            f"Amount: {amount} SOL\n"
+            f"Token: `{token_address[:12]}...`",
+            parse_mode="Markdown",
+        )
+        
+        try:
+            # Get token info
+            token_info = await self._token_service.get_token_info(token_address)
+            
+            # Execute
+            result = await self.executor.buy_token(
+                token_mint=token_address,
+                amount_sol=amount,
+                slippage_bps=settings.slippage_bps,
+            )
+            
+            if result.is_success:
+                entry_price = token_info.price_usd if token_info else 0
+                token_symbol = token_info.symbol if token_info else token_address[:8]
+                
+                # Add position
+                if entry_price > 0 and settings.auto_tp_sl:
+                    position = self._position_manager.add_position(
+                        token_address=token_address,
+                        token_symbol=token_symbol,
+                        entry_price_usd=entry_price,
+                        entry_amount_sol=amount,
+                        entry_token_amount=result.output_amount or 0,
+                        take_profit_pct=settings.take_profit_pct,
+                        stop_loss_pct=settings.stop_loss_pct,
+                    )
+                    
+                    await query.edit_message_text(
+                        f"✅ **Buy Successful!**\n\n"
+                        f"**Token:** {token_symbol}\n"
+                        f"**Spent:** {amount} SOL\n\n"
+                        f"📈 **TP:** {settings.take_profit_pct}%\n"
+                        f"📉 **SL:** {settings.stop_loss_pct}%\n\n"
+                        f"🔗 [View TX]({result.solscan_url})\n\n"
+                        f"_Position #{position.id}_",
+                        parse_mode="Markdown",
+                        reply_markup=build_back_button(),
+                    )
+                else:
+                    await query.edit_message_text(
+                        f"✅ **Buy Successful!**\n\n"
+                        f"🔗 [View TX]({result.solscan_url})",
+                        parse_mode="Markdown",
+                        reply_markup=build_back_button(),
+                    )
+            else:
+                await query.edit_message_text(
+                    f"❌ **Buy Failed**\n\n{result.error}",
+                    parse_mode="Markdown",
+                    reply_markup=build_back_button(),
+                )
+        except Exception as e:
+            logger.error("execute_buy_error", error=str(e))
+            await query.edit_message_text(
+                f"❌ Error: {e}",
+                reply_markup=build_back_button(),
+            )
+    
+    async def _handle_quick_buy(self, query, data: str) -> None:
+        """Quick buy from token info page."""
+        # Format: qbuy_{amount}_{token_prefix}
+        parts = data.replace("qbuy_", "").split("_", 1)
+        amount = float(parts[0])
+        token_prefix = parts[1] if len(parts) > 1 else ""
+        
+        user_id = query.from_user.id
+        settings = self._user_settings.get_settings(user_id)
+        
+        await self._execute_buy(query, token_prefix, amount, settings)
+    
+    async def _handle_sell_exec(self, query, data: str) -> None:
+        """Handle sell execution."""
+        # TODO: Implement sell
+        await query.edit_message_text(
+            "🔴 Sell feature coming soon!",
+            reply_markup=build_back_button(),
+        )
+    
+    async def _handle_quick_sell(self, query, data: str) -> None:
+        """Quick sell from token info page."""
+        # TODO: Implement sell
+        await query.edit_message_text(
+            "🔴 Sell feature coming soon!",
+            reply_markup=build_back_button(),
+        )
+    
+    async def _refresh_token_info(self, query, data: str) -> None:
+        """Refresh token info."""
+        token_prefix = data.replace("token_refresh_", "")
+        # TODO: Refetch and display token info
+        await query.answer("Refreshing...")
+    
+    # ==========================================
+    # POSITIONS HANDLERS
+    # ==========================================
+    
+    async def _show_positions(self, query) -> None:
+        """Show open positions."""
+        positions = self._position_manager.get_all_positions(open_only=True)
+        
+        if not positions:
+            message = "📊 **Open Positions**\n\nNo open positions.\n\nBuy a token to start!"
+        else:
+            message = "📊 **Open Positions**\n\n"
+            for pos in positions:
+                pnl_emoji = "🟢" if pos.current_pnl_pct >= 0 else "🔴"
+                message += (
+                    f"{pnl_emoji} **{pos.token_symbol}**\n"
+                    f"   PnL: {pos.current_pnl_pct:+.1f}%\n"
+                    f"   TP: {pos.take_profit_pct}% | SL: {pos.stop_loss_pct}%\n\n"
+                )
+        
+        await query.edit_message_text(
+            message.strip(),
+            reply_markup=build_positions_menu([p.to_dict() for p in positions]),
+            parse_mode="Markdown",
+        )
+    
+    async def _show_position_detail(self, query, data: str) -> None:
+        """Show position detail."""
+        pos_id = data.replace("pos_view_", "")
+        position = self._position_manager.get_position(pos_id)
+        
+        if not position:
+            await query.edit_message_text(
+                "Position not found.",
+                reply_markup=build_back_button("menu_positions"),
+            )
+            return
+        
+        pnl_emoji = "🟢" if position.current_pnl_pct >= 0 else "🔴"
+        
+        message = f"""
+📊 **Position #{position.id}**
+
+**Token:** {position.token_symbol}
+
+**Entry:**
+• Price: ${position.entry_price_usd:.8f}
+• Amount: {position.entry_amount_sol} SOL
+• Time: {position.entry_time.strftime("%H:%M %d/%m")}
+
+**Current:**
+• Price: ${position.current_price_usd:.8f}
+• PnL: {pnl_emoji} {position.current_pnl_pct:+.1f}%
+
+**Targets:**
+• 📈 TP: {position.take_profit_pct}% (${position.tp_price:.8f})
+• 📉 SL: {position.stop_loss_pct}% (${position.sl_price:.8f})
+"""
+        await query.edit_message_text(
+            message.strip(),
+            reply_markup=build_position_detail_menu(pos_id),
+            parse_mode="Markdown",
+        )
+    
+    async def _show_tp_options_for_position(self, query, data: str) -> None:
+        """Show TP options for a position."""
+        pos_id = data.replace("pos_tp_", "")
+        # Show TP options with position ID
+        await query.edit_message_text(
+            "📈 **Update Take Profit**\n\nSelect new TP percentage:",
+            reply_markup=build_tp_options(),
+            parse_mode="Markdown",
+        )
+    
+    async def _show_sl_options_for_position(self, query, data: str) -> None:
+        """Show SL options for a position."""
+        pos_id = data.replace("pos_sl_", "")
+        await query.edit_message_text(
+            "📉 **Update Stop Loss**\n\nSelect new SL percentage:",
+            reply_markup=build_sl_options(),
+            parse_mode="Markdown",
+        )
+    
+    async def _close_position(self, query, data: str) -> None:
+        """Close a position manually."""
+        pos_id = data.replace("pos_close_", "")
+        position = self._position_manager.close_position(pos_id, "manual")
+        
+        if position:
+            await query.edit_message_text(
+                f"✅ Position #{pos_id} closed.",
+                reply_markup=build_back_button("menu_positions"),
+            )
+        else:
+            await query.edit_message_text(
+                "❌ Could not close position.",
+                reply_markup=build_back_button("menu_positions"),
+            )
+    
+    # ==========================================
+    # WALLET HANDLERS
+    # ==========================================
+    
+    async def _show_wallet_menu(self, query) -> None:
+        """Show wallet management menu."""
+        try:
+            sol_balance = await self.solana.get_balance(self.wallet.address)
+        except:
+            sol_balance = 0.0
+        
+        message = f"""
+💼 **Wallet**
+
+**Address:**
+`{self.wallet.address}`
+
+**Balance:** {sol_balance:.4f} SOL
+
+🔗 [View on Solscan](https://solscan.io/account/{self.wallet.address})
+"""
+        await query.edit_message_text(
+            message.strip(),
+            reply_markup=build_wallet_menu(),
+            parse_mode="Markdown",
+        )
+    
+    async def _show_balance(self, query) -> None:
+        """Show wallet balance."""
+        await self._show_wallet_menu(query)
+    
+    async def _show_deposit_info(self, query) -> None:
+        """Show deposit information."""
+        message = f"""
+📥 **Deposit SOL**
+
+Send SOL to this address:
+
+`{self.wallet.address}`
+
+⚠️ Only send SOL on Solana network!
+"""
+        await query.edit_message_text(
+            message.strip(),
+            reply_markup=build_back_button("wallet_manage"),
+            parse_mode="Markdown",
+        )
+    
+    async def _show_withdraw_prompt(self, query) -> None:
+        """Show withdraw prompt."""
+        message = """
+📤 **Withdraw SOL**
+
+To withdraw, use:
+`/withdraw <address> <amount>`
+
+Example:
+`/withdraw 7xKXtg2CW87... 1.5`
+"""
+        await query.edit_message_text(
+            message.strip(),
+            reply_markup=build_back_button("wallet_manage"),
+            parse_mode="Markdown",
+        )
+    
+    async def _show_export_warning(self, query) -> None:
+        """Show export key warning."""
+        message = """
+⚠️ **Export Private Key**
+
+Your private key will be shown.
+**Never share it with anyone!**
+
+Use `/export` command in chat.
+_The message will be auto-deleted after 30 seconds._
+"""
+        await query.edit_message_text(
+            message.strip(),
+            reply_markup=build_back_button("wallet_manage"),
+            parse_mode="Markdown",
+        )
+    
+    async def _generate_wallet(self, query) -> None:
+        """Generate new wallet."""
+        # Note: This bot uses a single configured wallet
+        message = """
+🆕 **Generate Wallet**
+
+This bot uses your configured wallet.
+Update `.env` file to change wallet.
+"""
+        await query.edit_message_text(
+            message.strip(),
+            reply_markup=build_back_button("wallet_manage"),
+            parse_mode="Markdown",
+        )
+    
+    async def _show_import_prompt(self, query) -> None:
+        """Show import wallet prompt."""
+        message = """
+📥 **Import Wallet**
+
+This bot uses your configured wallet.
+Update `SOLANA_PRIVATE_KEY` in `.env` file.
+"""
+        await query.edit_message_text(
+            message.strip(),
+            reply_markup=build_back_button("wallet_manage"),
+            parse_mode="Markdown",
+        )
+    
+    # ==========================================
+    # SETTINGS HANDLERS
+    # ==========================================
+    
+    async def _show_settings(self, query) -> None:
+        """Show settings menu."""
+        user_id = query.from_user.id
+        settings = self._user_settings.get_settings(user_id)
+        message = self._user_settings.format_settings_message(user_id)
+        
+        await query.edit_message_text(
+            message.strip(),
+            reply_markup=build_settings_menu(settings.to_dict()),
+            parse_mode="Markdown",
+        )
+    
+    async def _show_buy_amount_options(self, query) -> None:
+        """Show buy amount options."""
+        await query.edit_message_text(
+            "💰 **Default Buy Amount**\n\nSelect amount:",
+            reply_markup=build_buy_amount_options(),
+            parse_mode="Markdown",
+        )
+    
+    async def _show_tp_options(self, query) -> None:
+        """Show TP options."""
+        await query.edit_message_text(
+            "📈 **Take Profit**\n\nSelect percentage:",
+            reply_markup=build_tp_options(),
+            parse_mode="Markdown",
+        )
+    
+    async def _show_sl_options(self, query) -> None:
+        """Show SL options."""
+        await query.edit_message_text(
+            "📉 **Stop Loss**\n\nSelect percentage:",
+            reply_markup=build_sl_options(),
+            parse_mode="Markdown",
+        )
+    
+    async def _show_slippage_options(self, query) -> None:
+        """Show slippage options."""
+        await query.edit_message_text(
+            "📊 **Slippage**\n\nSelect percentage:",
+            reply_markup=build_slippage_options(),
+            parse_mode="Markdown",
+        )
+    
+    async def _toggle_auto_confirm(self, query) -> None:
+        """Toggle auto buy confirmation."""
+        user_id = query.from_user.id
+        settings = self._user_settings.toggle_auto_confirm(user_id)
+        
+        status = "✅ ON" if settings.auto_buy_confirm else "❌ OFF"
+        await query.answer(f"Auto Confirm: {status}")
+        await self._show_settings(query)
+    
+    async def _set_buy_amount(self, query, data: str) -> None:
+        """Set buy amount."""
+        amount = float(data.replace("setamt_", ""))
+        user_id = query.from_user.id
+        self._user_settings.set_buy_amount(user_id, amount)
+        
+        await query.answer(f"Buy amount set to {amount} SOL")
+        await self._show_settings(query)
+    
+    async def _set_tp(self, query, data: str) -> None:
+        """Set take profit."""
+        tp = float(data.replace("settp_", ""))
+        user_id = query.from_user.id
+        self._user_settings.set_tp(user_id, tp)
+        
+        await query.answer(f"Take Profit set to {tp}%")
+        await self._show_settings(query)
+    
+    async def _set_sl(self, query, data: str) -> None:
+        """Set stop loss."""
+        sl = float(data.replace("setsl_", ""))
+        user_id = query.from_user.id
+        self._user_settings.set_sl(user_id, sl)
+        
+        await query.answer(f"Stop Loss set to {sl}%")
+        await self._show_settings(query)
+    
+    async def _set_slippage(self, query, data: str) -> None:
+        """Set slippage."""
+        slippage = int(data.replace("setslip_", ""))
+        user_id = query.from_user.id
+        self._user_settings.update_settings(user_id, slippage_bps=slippage)
+        
+        await query.answer(f"Slippage set to {slippage/100}%")
+        await self._show_settings(query)
+    
+    # ==========================================
+    # COPY TRADING HANDLERS
+    # ==========================================
+    
     async def _show_copy_status(self, query) -> None:
         """Show copy trading status."""
         enabled = self.settings.copy_trading.enabled
+        tracked = len(self.tracker.get_all_wallets()) if self.tracker else 0
         
         stats = {}
         if self.copy_trader:
             stats = self.copy_trader.get_stats()
         
-        status_emoji = "🟢" if enabled else "🔴"
-        
         message = f"""
-📑 **Copy Trading**
+📋 **Copy Trading**
 
-**Status:** {status_emoji} {"Enabled" if enabled else "Disabled"}
-
-**Statistics:**
-• Trades Detected: {stats.get('total_detected', 0)}
-• Trades Copied: {stats.get('total_copied', 0)}  
-• Trades Skipped: {stats.get('total_skipped', 0)}
-
-**Settings:**
-• Mode: {self.settings.copy_trading.sizing_mode}
-• Size: {self.settings.copy_trading.copy_percentage}%
-• Delay: {self.settings.copy_trading.copy_delay_seconds}s
-
-Use `/copy enable` or `/copy disable` to toggle.
-"""
-        await query.edit_message_text(
-            message.strip(),
-            reply_markup=build_back_button(),
-            parse_mode="Markdown",
-        )
-    
-    async def _show_pnl(self, query) -> None:
-        """Show PnL summary."""
-        if not self.pnl_tracker:
-            await query.edit_message_text(
-                "PnL tracking not enabled.",
-                reply_markup=build_back_button(),
-            )
-            return
-        
-        wallets = self.pnl_tracker.get_all_wallets_pnl()
-        
-        if not wallets:
-            message = """
-📈 **PnL Report**
-
-No trading data yet.
-
-Start trading or track wallets to see PnL.
-"""
-        else:
-            message = "📈 **PnL Summary**\n\n"
-            
-            for w in wallets[:5]:
-                emoji = "🟢" if w['total_pnl'] >= 0 else "🔴"
-                message += (
-                    f"{emoji} **{w['name']}**\n"
-                    f"   PnL: {w['total_pnl']:+.4f} SOL\n"
-                    f"   Win Rate: {w['win_rate']:.0f}%\n\n"
-                )
-        
-        await query.edit_message_text(
-            message.strip(),
-            reply_markup=build_back_button(),
-            parse_mode="Markdown",
-        )
-    
-    async def _show_settings(self, query) -> None:
-        """Show settings menu."""
-        trading = self.settings.trading
-        network = self.settings.network
-        network_emoji = "🟢" if network == "mainnet" else "🟡"
-        
-        message = f"""
-⚙️ **Settings**
-
-**Trading:**
-• Slippage: {trading.default_slippage_bps} bps ({trading.default_slippage_bps/100}%)
-• Default Amount: {trading.default_amount_sol} SOL
-
-**Copy Trading:**
-• Enabled: {self.settings.copy_trading.enabled}
-• Mode: {self.settings.copy_trading.sizing_mode}
-
-**Network:** {network_emoji} {network.upper()}
-
-Select an option to modify:
-"""
-        await query.edit_message_text(
-            message.strip(),
-            reply_markup=build_settings_menu(network),
-            parse_mode="Markdown",
-        )
-    
-    async def _show_status(self, query) -> None:
-        """Show bot status."""
-        try:
-            sol_balance = await self.solana.get_balance(self.wallet.address)
-            is_healthy = await self.solana.is_healthy()
-            
-            stats = self.executor.get_stats()
-            
-            tracked = 0
-            if self.tracker:
-                tracked = len(self.tracker.get_all_wallets())
-            
-            health = "🟢 Healthy" if is_healthy else "🔴 Unhealthy"
-            
-            message = f"""
-🔄 **Bot Status**
-
-**System:**
-• RPC: {health}
-• Network: {self.settings.network}
-
-**Wallet:**
-• Balance: {sol_balance:.4f} SOL
-
-**Trading:**
-• Total: {stats['total_trades']}
-• Success: {stats['successful_trades']}
-• Rate: {stats['success_rate']:.0f}%
-
-**Tracking:**
-• Wallets: {tracked}
-
-⏰ {datetime.now().strftime('%H:%M:%S')}
-"""
-            await query.edit_message_text(
-                message.strip(),
-                reply_markup=build_back_button(),
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            await query.edit_message_text(
-                f"Error: {e}",
-                reply_markup=build_back_button(),
-            )
-    
-    async def _handle_buy_amount(self, query, data: str) -> None:
-        """Handle buy amount selection."""
-        amount = data.replace("buy_", "")
-        
-        if amount == "custom":
-            message = """
-🟢 **Custom Buy**
-
-Send the amount and token address:
-`/buy <token_address> <sol_amount>`
-
-Example:
-`/buy EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 0.1`
-"""
-        else:
-            user_id = query.from_user.id
-            self._pending_actions[user_id] = {
-                "action": "buy",
-                "amount": float(amount),
-            }
-            
-            message = f"""
-🟢 **Buy {amount} SOL**
-
-Now paste the **token address** you want to buy:
-
-_(Just send the address in the next message)_
-"""
-        
-        await query.edit_message_text(
-            message.strip(),
-            reply_markup=build_back_button(),
-            parse_mode="Markdown",
-        )
-    
-    async def _handle_sell_percentage(self, query, data: str) -> None:
-        """Handle sell percentage selection."""
-        pct = data.replace("sell_", "")
-        
-        message = f"""
-🔴 **Sell {pct}%**
-
-Send the **token address** to sell:
-`/sell <token_address> <amount>`
-"""
-        
-        await query.edit_message_text(
-            message.strip(),
-            reply_markup=build_back_button(),
-            parse_mode="Markdown",
-        )
-    
-    async def _handle_wallet_action(self, query, data: str) -> None:
-        """Handle wallet-related actions."""
-        action = data.replace("wallet_", "")
-        
-        if action == "add":
-            message = """
-➕ **Add Wallet to Track**
-
-Send wallet address and name:
-`/track <address> <name>`
-
-Example:
-`/track 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU TopTrader`
-"""
-            await query.edit_message_text(
-                message.strip(),
-                reply_markup=build_back_button("menu_wallets"),
-                parse_mode="Markdown",
-            )
-        else:
-            # Show wallet details
-            if self.tracker:
-                wallet_info = None
-                for w in self.tracker.get_all_wallets():
-                    if w['address'].startswith(action):
-                        wallet_info = w
-                        break
-                
-                if wallet_info:
-                    message = f"""
-👛 **{wallet_info['name']}**
-
-**Address:**
-`{wallet_info['address']}`
+**Status:** {"🟢 Enabled" if enabled else "🔴 Disabled"}
+**Tracked Wallets:** {tracked}
 
 **Stats:**
-• Total Swaps: {wallet_info['total_swaps']}
-• Buys: 🟢 {wallet_info['total_buys']}
-• Sells: 🔴 {wallet_info['total_sells']}
-
-🔗 [Solscan](https://solscan.io/account/{wallet_info['address']})
-"""
-                    await query.edit_message_text(
-                        message.strip(),
-                        reply_markup=build_wallet_actions(wallet_info['address'], wallet_info['name']),
-                        parse_mode="Markdown",
-                    )
-                    return
-            
-            await query.edit_message_text(
-                "Wallet not found.",
-                reply_markup=build_back_button("menu_wallets"),
-            )
-    
-    async def _show_wallet_activity(self, query, address_prefix: str) -> None:
-        """Show activity for specific wallet."""
-        if not self.tracker:
-            return
-        
-        # Find full address
-        full_address = None
-        for w in self.tracker.get_all_wallets():
-            if w['address'].startswith(address_prefix):
-                full_address = w['address']
-                break
-        
-        if not full_address:
-            await query.edit_message_text(
-                "Wallet not found.",
-                reply_markup=build_back_button("menu_wallets"),
-            )
-            return
-        
-        activities = self.tracker.get_recent_activities(address=full_address, limit=5)
-        
-        if not activities:
-            message = f"No recent activity for this wallet."
-        else:
-            message = "📋 **Wallet Activity**\n\n"
-            for act in activities:
-                time = act.timestamp.strftime("%H:%M")
-                if act.swap_info:
-                    swap = act.swap_info
-                    direction = "🟢 BUY" if swap.direction.value == "buy" else "🔴 SELL"
-                    message += f"{direction} ({time})\n"
-        
-        await query.edit_message_text(
-            message.strip(),
-            reply_markup=build_back_button("menu_wallets"),
-            parse_mode="Markdown",
-        )
-    
-    async def _show_wallet_pnl(self, query, address_prefix: str) -> None:
-        """Show PnL for specific wallet."""
-        if not self.pnl_tracker:
-            await query.edit_message_text(
-                "PnL tracking not enabled.",
-                reply_markup=build_back_button("menu_wallets"),
-            )
-            return
-        
-        # Find full address
-        full_address = None
-        if self.tracker:
-            for w in self.tracker.get_all_wallets():
-                if w['address'].startswith(address_prefix):
-                    full_address = w['address']
-                    break
-        
-        if not full_address:
-            await query.edit_message_text(
-                "Wallet not found.",
-                reply_markup=build_back_button("menu_wallets"),
-            )
-            return
-        
-        report = self.pnl_tracker.format_pnl_report(full_address)
-        
-        await query.edit_message_text(
-            report,
-            reply_markup=build_back_button("menu_wallets"),
-            parse_mode="Markdown",
-        )
-    
-    async def _remove_wallet(self, query, address_prefix: str) -> None:
-        """Remove wallet from tracking."""
-        if not self.tracker:
-            return
-        
-        # Find and remove
-        for w in self.tracker.get_all_wallets():
-            if w['address'].startswith(address_prefix):
-                self.tracker.remove_wallet(w['address'])
-                await query.edit_message_text(
-                    f"✅ Stopped tracking `{w['address'][:8]}...`",
-                    reply_markup=build_back_button("menu_wallets"),
-                    parse_mode="Markdown",
-                )
-                return
-        
-        await query.edit_message_text(
-            "Wallet not found.",
-            reply_markup=build_back_button("menu_wallets"),
-        )
-    
-    async def _show_wallet_stats(self, query, address_prefix: str) -> None:
-        """Show historical wallet statistics."""
-        # Find full address
-        full_address = None
-        wallet_name = "Unknown"
-        
-        if self.tracker:
-            for w in self.tracker.get_all_wallets():
-                if w['address'].startswith(address_prefix):
-                    full_address = w['address']
-                    wallet_name = w.get('name', 'Unknown')
-                    break
-        
-        if not full_address:
-            # Maybe it's a direct address prefix
-            full_address = address_prefix
-        
-        # Show loading message
-        await query.edit_message_text(
-            f"🔄 **Analyzing wallet...**\n\n"
-            f"Fetching historical trades for\n`{full_address[:8]}...{full_address[-4:] if len(full_address) > 8 else ''}`\n\n"
-            f"_This may take a moment..._",
-            parse_mode="Markdown",
-        )
-        
-        try:
-            # Analyze wallet
-            stats = await self._wallet_analyzer.analyze_wallet(full_address, limit=50)
-            
-            # Format and display
-            message = self._wallet_analyzer.format_stats_message(stats)
-            
-            await query.edit_message_text(
-                message,
-                reply_markup=build_back_button("menu_wallets"),
-                parse_mode="Markdown",
-            )
-            
-        except Exception as e:
-            logger.error("wallet_stats_error", error=str(e))
-            await query.edit_message_text(
-                f"❌ Error analyzing wallet: {str(e)[:100]}",
-                reply_markup=build_back_button("menu_wallets"),
-            )
-    
-    async def _show_slippage_options(self, query) -> None:
-        """Show slippage options."""
-        current = self.settings.trading.default_slippage_bps
-        
-        message = f"""
-📊 **Slippage Settings**
-
-Current: {current} bps ({current/100}%)
-
-Select new slippage:
+• Detected: {stats.get('total_detected', 0)}
+• Copied: {stats.get('total_copied', 0)}
+• Skipped: {stats.get('total_skipped', 0)}
 """
         await query.edit_message_text(
             message.strip(),
-            reply_markup=build_slippage_options(),
-            parse_mode="Markdown",
-        )
-    
-    async def _set_slippage(self, query, data: str) -> None:
-        """Set slippage."""
-        bps = int(data.replace("slip_", ""))
-        self.settings.trading.default_slippage_bps = bps
-        
-        await query.edit_message_text(
-            f"✅ Slippage set to {bps} bps ({bps/100}%)",
-            reply_markup=build_back_button("menu_settings"),
-        )
-    
-    async def _show_network_options(self, query) -> None:
-        """Show network selection options."""
-        current = self.settings.network
-        current_emoji = "🟢" if current == "mainnet" else "🟡"
-        
-        message = f"""
-🌐 **Network Settings**
-
-Current: {current_emoji} **{current.upper()}**
-
-⚠️ **Warning:**
-• **Mainnet** = Real money, real trades
-• **Devnet** = Test network, fake SOL
-
-Select network:
-"""
-        await query.edit_message_text(
-            message.strip(),
-            reply_markup=build_network_menu(current),
-            parse_mode="Markdown",
-        )
-    
-    async def _set_network(self, query, data: str) -> None:
-        """Set network (mainnet/devnet)."""
-        new_network = data.replace("network_", "")
-        old_network = self.settings.network
-        
-        if new_network == old_network:
-            await query.edit_message_text(
-                f"Already on {new_network.upper()}",
-                reply_markup=build_back_button("menu_settings"),
-            )
-            return
-        
-        # Update settings
-        self.settings.network = new_network
-        
-        # Show confirmation with warning
-        if new_network == "mainnet":
-            emoji = "🟢"
-            warning = "\n\n⚠️ **You are now on MAINNET!**\nAll trades use REAL money!"
-        else:
-            emoji = "🟡"
-            warning = "\n\n✅ You are now on DEVNET (test mode)\nTrades use fake SOL."
-        
-        message = f"""
-{emoji} **Network Changed**
-
-Switched from {old_network.upper()} to **{new_network.upper()}**
-{warning}
-
-⚠️ **Note:** Restart the bot to apply RPC changes.
-`python run.py`
-"""
-        
-        await query.edit_message_text(
-            message.strip(),
-            reply_markup=build_back_button("menu_settings"),
-            parse_mode="Markdown",
-        )
-    
-    async def _show_copy_settings(self, query) -> None:
-        """Show copy trading settings."""
-        enabled = self.settings.copy_trading.enabled
-        status_emoji = "🟢" if enabled else "🔴"
-        
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "✅ Enable" if not enabled else "🟢 Enabled",
-                    callback_data="copy_enable"
-                ),
-                InlineKeyboardButton(
-                    "❌ Disable" if enabled else "🔴 Disabled",
-                    callback_data="copy_disable"
-                ),
-            ],
-            [InlineKeyboardButton("◀️ Back", callback_data="menu_settings")],
-        ]
-        
-        message = f"""
-📋 **Copy Trading Settings**
-
-**Status:** {status_emoji} {"Enabled" if enabled else "Disabled"}
-
-**Settings:**
-• Mode: {self.settings.copy_trading.sizing_mode}
-• Copy %: {self.settings.copy_trading.copy_percentage}%
-• Delay: {self.settings.copy_trading.copy_delay_seconds}s
-• Fixed Size: {self.settings.copy_trading.fixed_size_sol} SOL
-
-**Tracked Wallets:** {len(self.tracker.get_all_wallets()) if self.tracker else 0}
-
-Toggle copy trading:
-"""
-        from telegram import InlineKeyboardMarkup
-        await query.edit_message_text(
-            message.strip(),
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            reply_markup=build_copy_trade_menu(enabled, tracked),
             parse_mode="Markdown",
         )
     
     async def _enable_copy_trading(self, query) -> None:
         """Enable copy trading."""
         self.settings.copy_trading.enabled = True
-        
-        # Start copy trader if available
         if self.copy_trader:
             await self.copy_trader.start()
-        
-        await query.edit_message_text(
-            "✅ **Copy Trading Enabled!**\n\n"
-            "The bot will now copy trades from tracked wallets.",
-            reply_markup=build_back_button("set_copy"),
-            parse_mode="Markdown",
-        )
+        await query.answer("Copy trading enabled!")
+        await self._show_copy_status(query)
     
     async def _disable_copy_trading(self, query) -> None:
         """Disable copy trading."""
         self.settings.copy_trading.enabled = False
-        
-        # Stop copy trader if available
         if self.copy_trader:
             await self.copy_trader.stop()
-        
-        await query.edit_message_text(
-            "🔴 **Copy Trading Disabled**\n\n"
-            "The bot will no longer copy trades.",
-            reply_markup=build_back_button("set_copy"),
-            parse_mode="Markdown",
-        )
+        await query.answer("Copy trading disabled!")
+        await self._show_copy_status(query)
     
-    async def _show_alerts_settings(self, query) -> None:
-        """Show alerts settings."""
-        alerts = self.settings.telegram.alerts
-        
-        message = f"""
-🔔 **Alert Settings**
+    async def _show_add_wallet_prompt(self, query) -> None:
+        """Show add wallet prompt."""
+        message = """
+➕ **Add Wallet to Track**
 
-**Current Settings:**
-• Trade Execution: {"✅" if alerts.trade_execution else "❌"}
-• Trade Failure: {"✅" if alerts.trade_failure else "❌"}
-• Copy Trade: {"✅" if alerts.copy_trade else "❌"}
-• Wallet Activity: {"✅" if alerts.wallet_activity else "❌"}
-• Balance Change: {"✅" if alerts.balance_change else "❌"}
-• Error Notifications: {"✅" if alerts.error_notifications else "❌"}
+Use command:
+`/track <wallet_address> <name>`
 
-_Edit config.yaml to change these settings._
+Example:
+`/track 7xKXtg2CW87... AlphaTrader`
 """
         await query.edit_message_text(
             message.strip(),
-            reply_markup=build_back_button("menu_settings"),
+            reply_markup=build_back_button("menu_copy"),
             parse_mode="Markdown",
         )
     
-    async def _show_amount_settings(self, query) -> None:
-        """Show default amount settings."""
-        current = self.settings.trading.default_amount_sol
+    async def _show_tracked_wallets(self, query) -> None:
+        """Show tracked wallets list."""
+        if not self.tracker:
+            await query.edit_message_text(
+                "Wallet tracking not enabled.",
+                reply_markup=build_back_button("menu_copy"),
+            )
+            return
         
-        keyboard = [
-            [
-                InlineKeyboardButton("0.05 SOL", callback_data="amt_0.05"),
-                InlineKeyboardButton("0.1 SOL", callback_data="amt_0.1"),
-                InlineKeyboardButton("0.25 SOL", callback_data="amt_0.25"),
-            ],
-            [
-                InlineKeyboardButton("0.5 SOL", callback_data="amt_0.5"),
-                InlineKeyboardButton("1 SOL", callback_data="amt_1"),
-            ],
-            [InlineKeyboardButton("◀️ Back", callback_data="menu_settings")],
-        ]
+        wallets = self.tracker.get_all_wallets()
+        
+        if not wallets:
+            message = "📋 No wallets tracked.\n\nUse `/track <address>` to add one."
+        else:
+            message = "📋 **Tracked Wallets**\n\n"
+            for w in wallets[:5]:
+                message += f"**{w['name']}**\n`{w['address'][:12]}...`\n\n"
+        
+        await query.edit_message_text(
+            message.strip(),
+            reply_markup=build_tracked_wallets_menu(wallets),
+            parse_mode="Markdown",
+        )
+    
+    async def _show_wallet_detail(self, query, data: str) -> None:
+        """Show tracked wallet detail."""
+        addr_prefix = data.replace("copy_wallet_", "")
+        # Find wallet
+        if not self.tracker:
+            return
+        
+        wallets = self.tracker.get_all_wallets()
+        wallet = None
+        for w in wallets:
+            if w['address'].startswith(addr_prefix):
+                wallet = w
+                break
+        
+        if not wallet:
+            await query.edit_message_text(
+                "Wallet not found.",
+                reply_markup=build_back_button("copy_view_wallets"),
+            )
+            return
         
         message = f"""
-💵 **Default Trade Amount**
+👛 **{wallet['name']}**
 
-Current: **{current} SOL**
+**Address:**
+`{wallet['address']}`
 
-Select new default amount:
+**Activity:**
+• Swaps: {wallet['total_swaps']}
+• Buys: 🟢 {wallet['total_buys']}
+• Sells: 🔴 {wallet['total_sells']}
+
+🔗 [View on Solscan](https://solscan.io/account/{wallet['address']})
 """
-        from telegram import InlineKeyboardMarkup
+        short = wallet['address'][:16]
+        keyboard = [
+            [InlineKeyboardButton("🗑️ Remove", callback_data=f"copy_remove_{short}")],
+            [InlineKeyboardButton("◀️ Back", callback_data="copy_view_wallets")],
+        ]
+        
         await query.edit_message_text(
             message.strip(),
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown",
         )
     
-    async def _show_risk_settings(self, query) -> None:
-        """Show risk management settings."""
-        risk = self.settings.risk
+    async def _remove_tracked_wallet(self, query, data: str) -> None:
+        """Remove tracked wallet."""
+        addr_prefix = data.replace("copy_remove_", "")
         
-        message = f"""
-⚠️ **Risk Management**
+        if self.tracker:
+            # Find and remove
+            wallets = self.tracker.get_all_wallets()
+            for w in wallets:
+                if w['address'].startswith(addr_prefix):
+                    self.tracker.remove_wallet(w['address'])
+                    await query.answer("Wallet removed!")
+                    break
+        
+        await self._show_tracked_wallets(query)
+    
+    # ==========================================
+    # TEXT MESSAGE HANDLER
+    # ==========================================
+    
+    async def process_text_message(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> bool:
+        """
+        Process text messages (token addresses, URLs).
+        Returns True if handled.
+        """
+        if not self._is_admin(update.effective_user.id):
+            return False
+        
+        text = update.message.text.strip()
+        user_id = update.effective_user.id
+        
+        # Check for pending action
+        pending = self._pending.get(user_id, {})
+        
+        # Try to extract token address
+        token_address = TokenExtractor.extract_token(text)
+        
+        if token_address:
+            # Store token address
+            self._pending[user_id] = {
+                **pending,
+                "token_address": token_address,
+            }
+            
+            action = pending.get("action")
+            
+            if action == "buy":
+                # Show token info and buy confirmation
+                await self._show_token_buy_prompt(update, token_address)
+                return True
+            elif action == "sell":
+                # Show sell options
+                await self._show_token_sell_prompt(update, token_address)
+                return True
+            else:
+                # Default: show token info with quick actions
+                await self._show_token_info(update, token_address)
+                return True
+        
+        return False
+    
+    async def _show_token_buy_prompt(self, update: Update, token_address: str) -> None:
+        """Show token info and buy options."""
+        loading_msg = await update.message.reply_text("🔄 Fetching token info...")
+        
+        user_id = update.effective_user.id
+        settings = self._user_settings.get_settings(user_id)
+        
+        try:
+            info = await self._token_service.get_token_info(token_address)
+            
+            if info:
+                tp_price = info.price_usd * (1 + settings.take_profit_pct / 100)
+                sl_price = info.price_usd * (1 - settings.stop_loss_pct / 100)
+                
+                message = f"""
+🟢 **Buy: {info.name} ({info.symbol})**
 
-**Current Settings:**
-• Max Position: {risk.max_position_percentage}% of balance
-• Daily Loss Limit: {risk.daily_loss_limit_sol} SOL
-• Stop on Daily Limit: {"✅" if risk.stop_on_daily_limit else "❌"}
-• Max Concurrent Positions: {risk.max_concurrent_positions}
-• Confirm Above: {risk.confirm_above_sol} SOL
+💵 **Price:** ${info.price_usd:.8f}
+📊 **Market Cap:** ${info.market_cap:,.0f}
+💧 **Liquidity:** ${info.liquidity_usd:,.0f}
 
-_Edit config.yaml to change these settings._
+━━━━━━━━━━━━━━━━━━━━
+
+**Your Settings:**
+• Amount: **{settings.default_buy_amount_sol} SOL**
+• 📈 TP: {settings.take_profit_pct}% (${tp_price:.8f})
+• 📉 SL: {settings.stop_loss_pct}% (${sl_price:.8f})
+
+Select amount to buy:
 """
-        await query.edit_message_text(
+                await loading_msg.edit_text(
+                    message.strip(),
+                    reply_markup=build_buy_menu(token_address),
+                    parse_mode="Markdown",
+                )
+            else:
+                await loading_msg.edit_text(
+                    f"⚠️ Token not found.\n\n`{token_address}`\n\nBuy anyway?",
+                    reply_markup=build_buy_menu(token_address),
+                    parse_mode="Markdown",
+                )
+        except Exception as e:
+            logger.error("show_token_buy_error", error=str(e))
+            await loading_msg.edit_text(f"❌ Error: {e}")
+    
+    async def _show_token_sell_prompt(self, update: Update, token_address: str) -> None:
+        """Show token sell options."""
+        message = f"""
+🔴 **Sell Token**
+
+`{token_address[:20]}...`
+
+Select percentage to sell:
+"""
+        await update.message.reply_text(
             message.strip(),
-            reply_markup=build_back_button("menu_settings"),
+            reply_markup=build_sell_menu(token_address),
             parse_mode="Markdown",
         )
     
-    async def _follow_wallet(self, query, address_prefix: str) -> None:
-        """Follow a wallet."""
-        if self.tracker:
-            self.tracker.add_wallet(address_prefix, "Followed")
-            await query.edit_message_text(
-                f"✅ Now following wallet",
-                reply_markup=build_back_button("menu_wallets"),
-            )
+    async def _show_token_info(self, update: Update, token_address: str) -> None:
+        """Show token info with quick trade buttons."""
+        loading_msg = await update.message.reply_text("🔄 Fetching token info...")
+        
+        try:
+            info = await self._token_service.get_token_info(token_address)
+            
+            if info:
+                message = self._token_service.format_token_message(info)
+                await loading_msg.edit_text(
+                    message,
+                    reply_markup=build_token_action_menu(token_address, info.symbol),
+                    parse_mode="Markdown",
+                )
+            else:
+                await loading_msg.edit_text(
+                    f"❌ Token not found.\n\n`{token_address}`",
+                    reply_markup=build_back_button(),
+                    parse_mode="Markdown",
+                )
+        except Exception as e:
+            logger.error("show_token_info_error", error=str(e))
+            await loading_msg.edit_text(f"❌ Error: {e}")
     
-    async def _unfollow_wallet(self, query, address_prefix: str) -> None:
-        """Unfollow a wallet."""
-        if self.tracker:
-            for w in self.tracker.get_all_wallets():
-                if w['address'].startswith(address_prefix):
-                    self.tracker.remove_wallet(w['address'])
-                    break
-            await query.edit_message_text(
-                f"✅ Unfollowed wallet",
-                reply_markup=build_back_button("menu_wallets"),
-            )
+    # ==========================================
+    # PROPERTY ACCESSORS
+    # ==========================================
     
-    def get_pending_action(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """Get pending action for user."""
-        return self._pending_actions.get(user_id)
+    @property
+    def position_manager(self) -> PositionManager:
+        return self._position_manager
     
-    def clear_pending_action(self, user_id: int) -> None:
-        """Clear pending action for user."""
-        if user_id in self._pending_actions:
-            del self._pending_actions[user_id]
+    @property  
+    def user_settings(self) -> UserSettingsManager:
+        return self._user_settings
+    
+    @property
+    def token_service(self) -> TokenInfoService:
+        return self._token_service

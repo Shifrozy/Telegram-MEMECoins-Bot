@@ -165,6 +165,10 @@ class Settings(BaseSettings):
         default=False,
         description="Enable debug mode"
     )
+    dry_run: bool = Field(
+        default=False,
+        description="Dry run mode - simulate trades without executing"
+    )
     config_path: str = Field(
         default="config/config.yaml",
         description="Path to YAML config file"

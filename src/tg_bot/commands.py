@@ -1,5 +1,6 @@
 """
 Telegram command handlers for the trading bot.
+Clean, simplified command structure with auto-trading features.
 """
 
 from typing import Optional, Dict, Any
@@ -19,7 +20,20 @@ from src.tracking.copy_trader import CopyTrader
 from src.tracking.pnl_tracker import PnLTracker
 from src.tracking.wallet_analyzer import WalletAnalyzer
 from src.trading.token_info import TokenInfoService
-from src.trading.limit_orders import LimitOrderService, OrderType, OrderStatus
+from src.trading.position_manager import PositionManager, Position
+from src.trading.user_settings import UserSettingsManager
+from src.tg_bot.keyboards import (
+    build_main_menu,
+    build_wallet_setup_menu,
+    build_main_trading_menu,
+    build_back_button,
+    build_settings_menu,
+    build_positions_menu,
+    build_token_action_menu,
+    build_buy_menu,
+    build_buy_confirm_menu,
+)
+from src.tg_bot.wallet_connection import WalletConnectionManager, TokenExtractor
 
 logger = get_logger(__name__)
 
@@ -28,15 +42,14 @@ class CommandHandler:
     """
     Handles Telegram bot commands.
     
-    Commands:
-    - /start, /help - Show help
-    - /balance - Show wallet balance
-    - /buy <token> <amount> - Buy token with SOL
-    - /sell <token> <amount> - Sell token for SOL
-    - /status - Show bot status
-    - /wallets - Show tracked wallets
-    - /pnl - Show PnL report
-    - /settings - Show current settings
+    Core Commands:
+    - /start - Main menu
+    - /buy <token> - Buy token
+    - /sell <token> - Sell token
+    - /balance - Wallet balance
+    - /positions - Open positions with TP/SL
+    - /settings - Trading settings (TP, SL, Amount)
+    - /copy - Copy trading
     """
     
     def __init__(
@@ -49,18 +62,6 @@ class CommandHandler:
         copy_trader: Optional[CopyTrader] = None,
         pnl_tracker: Optional[PnLTracker] = None,
     ):
-        """
-        Initialize command handler.
-        
-        Args:
-            settings: Application settings
-            solana: Solana client
-            wallet: Wallet manager
-            executor: Trade executor
-            tracker: Optional wallet tracker
-            copy_trader: Optional copy trader
-            pnl_tracker: Optional PnL tracker
-        """
         self.settings = settings
         self.solana = solana
         self.wallet = wallet
@@ -71,17 +72,18 @@ class CommandHandler:
         
         self.admin_id = settings.telegram_admin_id
         
-        # Initialize wallet analyzer for historical stats
+        # Initialize services
         self._wallet_analyzer = WalletAnalyzer(solana)
-        
-        # Initialize token info service
         self._token_service = TokenInfoService()
-        
-        # Initialize limit order service
-        self._limit_service = LimitOrderService(
+        self._user_settings = UserSettingsManager()
+        self._position_manager = PositionManager(
             token_service=self._token_service,
             executor=executor,
         )
+        self._wallet_connection = WalletConnectionManager()
+        
+        # Pending actions (user_id -> action data)
+        self._pending: Dict[int, Dict[str, Any]] = {}
     
     def _is_admin(self, user_id: int) -> bool:
         """Check if user is admin."""
@@ -90,22 +92,65 @@ class CommandHandler:
     async def _check_admin(self, update: Update) -> bool:
         """Check admin and send error if not."""
         if not self._is_admin(update.effective_user.id):
-            await update.message.reply_text(
-                "⛔ Unauthorized. This bot is private."
-            )
+            await update.message.reply_text("⛔ Unauthorized. This bot is private.")
             return False
         return True
+    
+    # ==========================================
+    # CORE COMMANDS
+    # ==========================================
     
     async def cmd_start(
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
-        """Handle /start command."""
+        """Handle /start command - Main menu."""
         if not await self._check_admin(update):
             return
         
-        await self.cmd_help(update, context)
+        user_id = update.effective_user.id
+        user_name = update.effective_user.first_name or "Trader"
+        user_settings = self._user_settings.get_settings(user_id)
+        
+        # Get balance
+        try:
+            sol_balance = await self.solana.get_balance(self.wallet.address)
+        except:
+            sol_balance = 0.0
+        
+        # Get open positions count
+        open_positions = len(self._position_manager.get_all_positions(open_only=True))
+        
+        message = f"""
+🚀 **Solana Trading Bot**
+
+Welcome, {user_name}! 👋
+
+━━━━━━━━━━━━━━━━━━━━
+
+💰 **Balance:** {sol_balance:.4f} SOL
+📊 **Open Positions:** {open_positions}
+
+━━━━━━━━━━━━━━━━━━━━
+
+**Quick Settings:**
+• Buy Amount: {user_settings.default_buy_amount_sol} SOL
+• Take Profit: {user_settings.take_profit_pct}%
+• Stop Loss: {user_settings.stop_loss_pct}%
+
+━━━━━━━━━━━━━━━━━━━━
+
+**🔥 Quick Trade:**
+Just paste a token address to start trading!
+
+Select an option below:
+"""
+        await update.message.reply_text(
+            message.strip(),
+            reply_markup=build_main_menu(),
+            parse_mode="Markdown",
+        )
     
     async def cmd_help(
         self,
@@ -117,37 +162,36 @@ class CommandHandler:
             return
         
         help_text = """
-🤖 **Solana Trading Bot**
+🤖 **Solana Trading Bot - Help**
 
-**Trading Commands:**
-• `/balance` - Show wallet balance
-• `/buy <token> <sol_amount>` - Buy token with SOL
-• `/sell <token> <amount>` - Sell token for SOL
-• `/menu` - Interactive menu with buttons
+**📱 Quick Start:**
+Just paste a token address and the bot will ask to buy!
 
-**Tracking Commands:**
-• `/wallets` - List tracked wallets
-• `/track <address> [name]` - Add wallet to track
-• `/untrack <address>` - Remove tracked wallet
-• `/activity [address]` - Show recent activity
-• `/stats <address>` - Analyze wallet history 📊
+**💹 Trading Commands:**
+• `/buy <token>` - Buy token with your default amount
+• `/sell <token>` - Sell token
+• `/balance` - Check wallet balance
 
-**Copy Trading:**
-• `/copy status` - Copy trading status
-• `/copy enable` - Enable copy trading
-• `/copy disable` - Disable copy trading
+**📊 Position Management:**
+• `/positions` - View open positions with TP/SL
+• All positions auto-sell on TP or SL hit!
 
-**Reports:**
-• `/pnl [address]` - Show PnL report
-• `/status` - Show bot status
+**⚙️ Settings:**
+• `/settings` - Change Buy Amount, TP%, SL%
+• `/tp <percent>` - Set Take Profit (e.g., /tp 50)
+• `/sl <percent>` - Set Stop Loss (e.g., /sl 25)
+• `/amount <sol>` - Set buy amount (e.g., /amount 0.5)
 
-**Settings:**
-• `/settings` - View current settings
-• `/slippage <bps>` - Set default slippage
+**📋 Copy Trading:**
+• `/copy` - Manage copy trading
+• `/track <address>` - Track a wallet
 
-Use token mint addresses or search by symbol.
+**🔄 Other:**
+• `/status` - Bot status
+• `/menu` - Show main menu
+
+💡 **Tip:** Paste any DEX Screener, Pump.fun, or Jupiter link!
 """
-        
         await update.message.reply_text(
             help_text.strip(),
             parse_mode="Markdown",
@@ -163,25 +207,28 @@ Use token mint addresses or search by symbol.
             return
         
         try:
-            # Get SOL balance
             sol_balance = await self.solana.get_balance(self.wallet.address)
+            
+            # Get SOL price
+            sol_price = await self._token_service.get_sol_price()
+            usd_value = sol_balance * sol_price if sol_price else 0
             
             message = f"""
 💰 **Wallet Balance**
 
-**Address:** `{self.wallet.address[:8]}...{self.wallet.address[-4:]}`
-**SOL:** {sol_balance:.4f}
+**Address:** 
+`{self.wallet.address[:8]}...{self.wallet.address[-4:]}`
+
+**SOL Balance:** {sol_balance:.4f} SOL
+**USD Value:** ~${usd_value:.2f}
 
 🔗 [View on Solscan](https://solscan.io/account/{self.wallet.address})
 """
-            
-            # TODO: Add token balances
-            
             await update.message.reply_text(
                 message.strip(),
                 parse_mode="Markdown",
+                reply_markup=build_back_button(),
             )
-            
         except Exception as e:
             logger.error("balance_command_error", error=str(e))
             await update.message.reply_text(f"❌ Error: {e}")
@@ -191,124 +238,404 @@ Use token mint addresses or search by symbol.
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
-        """Handle /buy <token> <amount> command."""
+        """Handle /buy <token> [amount] command."""
         if not await self._check_admin(update):
             return
         
         args = context.args
+        user_id = update.effective_user.id
+        user_settings = self._user_settings.get_settings(user_id)
         
-        if len(args) < 2:
+        if not args:
             await update.message.reply_text(
-                "Usage: `/buy <token_mint> <sol_amount>`\n"
-                "Example: `/buy EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 0.1`",
+                "🟢 **Buy Token**\n\n"
+                "Usage: `/buy <token_address> [amount_sol]`\n\n"
+                "Example:\n"
+                "`/buy EPjFWdd5...`\n"
+                "`/buy EPjFWdd5... 0.5`\n\n"
+                f"Default amount: **{user_settings.default_buy_amount_sol} SOL**",
                 parse_mode="Markdown",
             )
             return
         
-        token_mint = args[0]
+        token_address = args[0]
+        
+        # Get amount (from args or default)
+        if len(args) > 1:
+            try:
+                amount_sol = float(args[1])
+            except ValueError:
+                await update.message.reply_text("❌ Invalid amount")
+                return
+        else:
+            amount_sol = user_settings.default_buy_amount_sol
+        
+        # Check if auto confirm is off
+        if user_settings.auto_buy_confirm:
+            # Show confirmation
+            await self._show_buy_confirmation(
+                update, token_address, amount_sol, user_settings
+            )
+        else:
+            # Execute immediately
+            await self._execute_buy(update, token_address, amount_sol, user_settings)
+    
+    async def _show_buy_confirmation(
+        self,
+        update: Update,
+        token_address: str,
+        amount_sol: float,
+        user_settings,
+    ) -> None:
+        """Show buy confirmation with token info."""
+        loading_msg = await update.message.reply_text("🔄 Fetching token info...")
         
         try:
-            sol_amount = float(args[1])
-        except ValueError:
-            await update.message.reply_text("❌ Invalid amount. Use a number.")
-            return
-        
-        # Validate amount against risk settings
-        if sol_amount > self.settings.risk.confirm_above_sol:
-            await update.message.reply_text(
-                f"⚠️ Trade exceeds {self.settings.risk.confirm_above_sol} SOL.\n"
-                f"Reply 'CONFIRM {sol_amount} {token_mint[:8]}' to proceed.",
-            )
-            return
-        
-        await update.message.reply_text(
-            f"🔄 Executing buy...\n"
-            f"Token: `{token_mint[:8]}...`\n"
-            f"Amount: {sol_amount} SOL",
+            # Get token info
+            token_info = await self._token_service.get_token_info(token_address)
+            
+            if token_info:
+                symbol = token_info.symbol or "???"
+                name = token_info.name or "Unknown"
+                price = token_info.price_usd or 0
+                mcap = token_info.market_cap or 0
+                liq = token_info.liquidity_usd or 0
+                
+                # Calculate TP/SL prices
+                tp_price = price * (1 + user_settings.take_profit_pct / 100)
+                sl_price = price * (1 - user_settings.stop_loss_pct / 100)
+                
+                message = f"""
+🟢 **Buy Confirmation**
+
+**Token:** {name} ({symbol})
+**Address:** `{token_address[:12]}...`
+
+💵 **Price:** ${price:.8f}
+📊 **Market Cap:** ${mcap:,.0f}
+💧 **Liquidity:** ${liq:,.0f}
+
+━━━━━━━━━━━━━━━━━━━━
+
+**Your Order:**
+• Amount: **{amount_sol} SOL**
+• Slippage: {user_settings.slippage_bps / 100}%
+
+**Auto TP/SL:**
+• 📈 Take Profit: {user_settings.take_profit_pct}% (${tp_price:.8f})
+• 📉 Stop Loss: {user_settings.stop_loss_pct}% (${sl_price:.8f})
+
+━━━━━━━━━━━━━━━━━━━━
+
+Confirm to proceed:
+"""
+                await loading_msg.edit_text(
+                    message.strip(),
+                    reply_markup=build_buy_confirm_menu(token_address, amount_sol),
+                    parse_mode="Markdown",
+                )
+            else:
+                await loading_msg.edit_text(
+                    f"⚠️ Token not found or no data.\n\n"
+                    f"Address: `{token_address}`\n\n"
+                    f"Buy anyway?",
+                    reply_markup=build_buy_confirm_menu(token_address, amount_sol),
+                    parse_mode="Markdown",
+                )
+        except Exception as e:
+            logger.error("show_buy_confirmation_error", error=str(e))
+            await loading_msg.edit_text(f"❌ Error: {e}")
+    
+    async def _execute_buy(
+        self,
+        update: Update,
+        token_address: str,
+        amount_sol: float,
+        user_settings,
+    ) -> None:
+        """Execute the buy order."""
+        loading_msg = await update.message.reply_text(
+            f"🔄 **Executing Buy...**\n\n"
+            f"Amount: {amount_sol} SOL\n"
+            f"Token: `{token_address[:12]}...`",
             parse_mode="Markdown",
         )
         
         try:
+            # Get token info for position tracking
+            token_info = await self._token_service.get_token_info(token_address)
+            
+            # Execute trade
             result = await self.executor.buy_token(
-                token_mint=token_mint,
-                amount_sol=sol_amount,
+                token_mint=token_address,
+                amount_sol=amount_sol,
+                slippage_bps=user_settings.slippage_bps,
             )
             
             if result.is_success:
-                await update.message.reply_text(
-                    f"✅ **Buy Successful!**\n"
-                    f"🔗 [View Transaction]({result.solscan_url})",
-                    parse_mode="Markdown",
-                )
+                # Add position for TP/SL monitoring
+                entry_price = token_info.price_usd if token_info else 0
+                token_symbol = token_info.symbol if token_info else token_address[:8]
+                
+                # Estimate tokens received (rough)
+                tokens_received = result.output_amount or 0
+                
+                if entry_price > 0 and user_settings.auto_tp_sl:
+                    position = self._position_manager.add_position(
+                        token_address=token_address,
+                        token_symbol=token_symbol,
+                        entry_price_usd=entry_price,
+                        entry_amount_sol=amount_sol,
+                        entry_token_amount=tokens_received,
+                        take_profit_pct=user_settings.take_profit_pct,
+                        stop_loss_pct=user_settings.stop_loss_pct,
+                    )
+                    
+                    await loading_msg.edit_text(
+                        f"✅ **Buy Successful!**\n\n"
+                        f"**Token:** {token_symbol}\n"
+                        f"**Spent:** {amount_sol} SOL\n\n"
+                        f"📈 **TP:** {user_settings.take_profit_pct}% (${position.tp_price:.8f})\n"
+                        f"📉 **SL:** {user_settings.stop_loss_pct}% (${position.sl_price:.8f})\n\n"
+                        f"🔗 [View TX]({result.solscan_url})\n\n"
+                        f"_Position #{position.id} created with auto TP/SL_",
+                        parse_mode="Markdown",
+                        reply_markup=build_back_button(),
+                    )
+                else:
+                    await loading_msg.edit_text(
+                        f"✅ **Buy Successful!**\n\n"
+                        f"**Spent:** {amount_sol} SOL\n"
+                        f"🔗 [View TX]({result.solscan_url})",
+                        parse_mode="Markdown",
+                        reply_markup=build_back_button(),
+                    )
             else:
-                await update.message.reply_text(
-                    f"❌ **Buy Failed**\n"
+                await loading_msg.edit_text(
+                    f"❌ **Buy Failed**\n\n"
                     f"Error: {result.error}",
                     parse_mode="Markdown",
+                    reply_markup=build_back_button(),
                 )
-                
         except Exception as e:
-            logger.error("buy_command_error", error=str(e))
-            await update.message.reply_text(f"❌ Error: {e}")
+            logger.error("execute_buy_error", error=str(e))
+            await loading_msg.edit_text(f"❌ Error: {e}")
     
     async def cmd_sell(
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
-        """Handle /sell <token> <amount> command."""
+        """Handle /sell <token> [percent] command."""
         if not await self._check_admin(update):
             return
         
         args = context.args
         
-        if len(args) < 2:
+        if not args:
             await update.message.reply_text(
-                "Usage: `/sell <token_mint> <token_amount>`\n"
-                "Example: `/sell EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 100`",
+                "🔴 **Sell Token**\n\n"
+                "Usage: `/sell <token_address> [percent]`\n\n"
+                "Example:\n"
+                "`/sell EPjFWdd5...` - Sell 100%\n"
+                "`/sell EPjFWdd5... 50` - Sell 50%\n",
                 parse_mode="Markdown",
             )
             return
         
-        token_mint = args[0]
+        token_address = args[0]
+        percent = int(args[1]) if len(args) > 1 else 100
         
-        try:
-            token_amount = float(args[1])
-        except ValueError:
-            await update.message.reply_text("❌ Invalid amount. Use a number.")
-            return
-        
+        # TODO: Get user's token balance and calculate amount
         await update.message.reply_text(
-            f"🔄 Executing sell...\n"
-            f"Token: `{token_mint[:8]}...`\n"
-            f"Amount: {token_amount}",
+            f"🔄 **Selling {percent}%...**\n\n"
+            f"Token: `{token_address[:12]}...`",
             parse_mode="Markdown",
         )
         
-        try:
-            # TODO: Get token decimals dynamically
-            result = await self.executor.sell_token(
-                token_mint=token_mint,
-                amount=token_amount,
-                decimals=6,  # Common for many tokens
+        # Close position if exists
+        position = self._position_manager.get_position_by_token(token_address)
+        if position:
+            self._position_manager.close_position(position.id, "manual_sell")
+    
+    async def cmd_positions(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /positions command - Show open positions."""
+        if not await self._check_admin(update):
+            return
+        
+        positions = self._position_manager.get_all_positions(open_only=True)
+        
+        if not positions:
+            await update.message.reply_text(
+                "📊 **Open Positions**\n\n"
+                "No open positions.\n\n"
+                "Buy a token to start tracking!",
+                parse_mode="Markdown",
+                reply_markup=build_back_button(),
             )
+            return
+        
+        message = "📊 **Open Positions**\n\n"
+        
+        for pos in positions:
+            pnl_emoji = "🟢" if pos.current_pnl_pct >= 0 else "🔴"
             
-            if result.is_success:
-                await update.message.reply_text(
-                    f"✅ **Sell Successful!**\n"
-                    f"🔗 [View Transaction]({result.solscan_url})",
-                    parse_mode="Markdown",
-                )
-            else:
-                await update.message.reply_text(
-                    f"❌ **Sell Failed**\n"
-                    f"Error: {result.error}",
-                    parse_mode="Markdown",
-                )
-                
-        except Exception as e:
-            logger.error("sell_command_error", error=str(e))
-            await update.message.reply_text(f"❌ Error: {e}")
+            message += (
+                f"{pnl_emoji} **{pos.token_symbol}**\n"
+                f"   Entry: ${pos.entry_price_usd:.8f}\n"
+                f"   Current: ${pos.current_price_usd:.8f}\n"
+                f"   PnL: {pos.current_pnl_pct:+.1f}%\n"
+                f"   TP: {pos.take_profit_pct}% | SL: {pos.stop_loss_pct}%\n\n"
+            )
+        
+        # Add stats
+        stats = self._position_manager.get_stats()
+        message += f"\n━━━━━━━━━━━━━━━━━━━━\n"
+        message += f"Total: {stats['total_positions']} | "
+        message += f"Wins: {stats['tp_wins']} | "
+        message += f"Losses: {stats['sl_losses']}"
+        
+        positions_data = [p.to_dict() for p in positions]
+        
+        await update.message.reply_text(
+            message.strip(),
+            parse_mode="Markdown",
+            reply_markup=build_positions_menu(positions_data),
+        )
+    
+    async def cmd_settings(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /settings command."""
+        if not await self._check_admin(update):
+            return
+        
+        user_id = update.effective_user.id
+        settings = self._user_settings.get_settings(user_id)
+        message = self._user_settings.format_settings_message(user_id)
+        
+        await update.message.reply_text(
+            message.strip(),
+            parse_mode="Markdown",
+            reply_markup=build_settings_menu(settings.to_dict()),
+        )
+    
+    async def cmd_tp(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /tp <percent> command - Set Take Profit."""
+        if not await self._check_admin(update):
+            return
+        
+        args = context.args
+        user_id = update.effective_user.id
+        
+        if not args:
+            settings = self._user_settings.get_settings(user_id)
+            await update.message.reply_text(
+                f"📈 **Take Profit Settings**\n\n"
+                f"Current: **{settings.take_profit_pct}%**\n\n"
+                f"Usage: `/tp <percent>`\n"
+                f"Example: `/tp 75`",
+                parse_mode="Markdown",
+            )
+            return
+        
+        try:
+            tp_pct = float(args[0])
+            if tp_pct <= 0 or tp_pct > 1000:
+                await update.message.reply_text("❌ TP must be between 1% and 1000%")
+                return
+            
+            self._user_settings.set_tp(user_id, tp_pct)
+            await update.message.reply_text(
+                f"✅ Take Profit set to **{tp_pct}%**",
+                parse_mode="Markdown",
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid percentage")
+    
+    async def cmd_sl(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /sl <percent> command - Set Stop Loss."""
+        if not await self._check_admin(update):
+            return
+        
+        args = context.args
+        user_id = update.effective_user.id
+        
+        if not args:
+            settings = self._user_settings.get_settings(user_id)
+            await update.message.reply_text(
+                f"📉 **Stop Loss Settings**\n\n"
+                f"Current: **{settings.stop_loss_pct}%**\n\n"
+                f"Usage: `/sl <percent>`\n"
+                f"Example: `/sl 20`",
+                parse_mode="Markdown",
+            )
+            return
+        
+        try:
+            sl_pct = float(args[0])
+            if sl_pct <= 0 or sl_pct > 100:
+                await update.message.reply_text("❌ SL must be between 1% and 100%")
+                return
+            
+            self._user_settings.set_sl(user_id, sl_pct)
+            await update.message.reply_text(
+                f"✅ Stop Loss set to **{sl_pct}%**",
+                parse_mode="Markdown",
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid percentage")
+    
+    async def cmd_amount(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /amount <sol> command - Set default buy amount."""
+        if not await self._check_admin(update):
+            return
+        
+        args = context.args
+        user_id = update.effective_user.id
+        
+        if not args:
+            settings = self._user_settings.get_settings(user_id)
+            await update.message.reply_text(
+                f"💰 **Default Buy Amount**\n\n"
+                f"Current: **{settings.default_buy_amount_sol} SOL**\n\n"
+                f"Usage: `/amount <sol>`\n"
+                f"Example: `/amount 0.5`",
+                parse_mode="Markdown",
+            )
+            return
+        
+        try:
+            amount = float(args[0])
+            if amount <= 0 or amount > 100:
+                await update.message.reply_text("❌ Amount must be between 0.01 and 100 SOL")
+                return
+            
+            self._user_settings.set_buy_amount(user_id, amount)
+            await update.message.reply_text(
+                f"✅ Default buy amount set to **{amount} SOL**",
+                parse_mode="Markdown",
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid amount")
     
     async def cmd_status(
         self,
@@ -322,65 +649,149 @@ Use token mint addresses or search by symbol.
         try:
             sol_balance = await self.solana.get_balance(self.wallet.address)
             is_healthy = await self.solana.is_healthy()
-            
-            # Get execution stats
             exec_stats = self.executor.get_stats()
+            pos_stats = self._position_manager.get_stats()
             
-            # Get copy trading stats
-            copy_stats = {}
+            # Copy trading stats
             copy_enabled = "Disabled"
-            if self.copy_trader:
-                copy_stats = self.copy_trader.get_stats()
-                if self.settings.copy_trading.enabled:
-                    copy_enabled = "Enabled"
-            
-            # Get tracker stats
             tracked_wallets = 0
+            if self.copy_trader and self.settings.copy_trading.enabled:
+                copy_enabled = "Enabled"
             if self.tracker:
                 tracked_wallets = len(self.tracker.get_all_wallets())
             
             message = f"""
-📊 **Bot Status**
+🔄 **Bot Status**
 
-**Wallet:**
-• Address: `{self.wallet.address[:8]}...{self.wallet.address[-4:]}`
-• Balance: {sol_balance:.4f} SOL
+**System:**
+• RPC: {"🟢 Healthy" if is_healthy else "🔴 Unhealthy"}
 • Network: {self.settings.network}
 
-**RPC Status:** {"🟢 Healthy" if is_healthy else "🔴 Unhealthy"}
+**Wallet:**
+• Balance: {sol_balance:.4f} SOL
+• Address: `{self.wallet.address[:8]}...`
 
 **Trading Stats:**
 • Total Trades: {exec_stats['total_trades']}
-• Successful: {exec_stats['successful_trades']}
-• Failed: {exec_stats['failed_trades']}
-• Success Rate: {exec_stats['success_rate']:.1f}%
+• Success Rate: {exec_stats['success_rate']:.0f}%
+
+**Positions:**
+• Open: {pos_stats['open_positions']}
+• TP Wins: {pos_stats['tp_wins']}
+• SL Losses: {pos_stats['sl_losses']}
 
 **Copy Trading:** {copy_enabled}
-• Detected: {copy_stats.get('total_detected', 0)}
-• Copied: {copy_stats.get('total_copied', 0)}
-• Skipped: {copy_stats.get('total_skipped', 0)}
+• Tracked Wallets: {tracked_wallets}
 
-**Tracking:**
-• Monitored Wallets: {tracked_wallets}
-
-⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+⏰ {datetime.now().strftime('%H:%M:%S')}
 """
-            
             await update.message.reply_text(
                 message.strip(),
                 parse_mode="Markdown",
+                reply_markup=build_back_button(),
             )
-            
         except Exception as e:
-            logger.error("status_command_error", error=str(e))
+            logger.error("status_error", error=str(e))
             await update.message.reply_text(f"❌ Error: {e}")
+    
+    # ==========================================
+    # COPY TRADING COMMANDS
+    # ==========================================
+    
+    async def cmd_copy(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /copy command."""
+        if not await self._check_admin(update):
+            return
+        
+        if not self.copy_trader:
+            await update.message.reply_text("Copy trading not configured.")
+            return
+        
+        args = context.args
+        subcommand = args[0].lower() if args else "status"
+        
+        if subcommand == "status":
+            stats = self.copy_trader.get_stats()
+            enabled = self.settings.copy_trading.enabled
+            tracked = len(self.tracker.get_all_wallets()) if self.tracker else 0
+            
+            message = f"""
+📋 **Copy Trading**
+
+**Status:** {"🟢 Enabled" if enabled else "🔴 Disabled"}
+**Tracked Wallets:** {tracked}
+
+**Stats:**
+• Detected: {stats['total_detected']}
+• Copied: {stats['total_copied']}
+• Skipped: {stats['total_skipped']}
+
+**Settings:**
+• Size: {self.settings.copy_trading.copy_percentage}%
+• Delay: {self.settings.copy_trading.copy_delay_seconds}s
+"""
+            from src.tg_bot.keyboards import build_copy_trade_menu
+            await update.message.reply_text(
+                message.strip(),
+                parse_mode="Markdown",
+                reply_markup=build_copy_trade_menu(enabled, tracked),
+            )
+        
+        elif subcommand == "enable":
+            self.settings.copy_trading.enabled = True
+            await self.copy_trader.start()
+            await update.message.reply_text("✅ Copy trading enabled")
+        
+        elif subcommand == "disable":
+            self.settings.copy_trading.enabled = False
+            await self.copy_trader.stop()
+            await update.message.reply_text("⏹️ Copy trading disabled")
+    
+    async def cmd_track(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /track <address> [name] command."""
+        if not await self._check_admin(update):
+            return
+        
+        if not self.tracker:
+            await update.message.reply_text("Wallet tracking not enabled.")
+            return
+        
+        args = context.args
+        
+        if not args:
+            await update.message.reply_text(
+                "Usage: `/track <wallet_address> [name]`",
+                parse_mode="Markdown",
+            )
+            return
+        
+        address = args[0]
+        name = args[1] if len(args) > 1 else "Trader"
+        
+        if not WalletManager.is_valid_address(address):
+            await update.message.reply_text("❌ Invalid wallet address")
+            return
+        
+        self.tracker.add_wallet(address, name)
+        await update.message.reply_text(
+            f"✅ Now tracking:\n**{name}**\n`{address}`",
+            parse_mode="Markdown",
+        )
     
     async def cmd_wallets(
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
-        """Handle /wallets command."""
+        """Handle /wallets command - Show tracked wallets."""
         if not await self._check_admin(update):
             return
         
@@ -413,44 +824,150 @@ Use token mint addresses or search by symbol.
             parse_mode="Markdown",
         )
     
-    async def cmd_track(
+    async def cmd_token(
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
-        """Handle /track <address> [name] command."""
+        """Handle /token <address> command - Get token info."""
         if not await self._check_admin(update):
-            return
-        
-        if not self.tracker:
-            await update.message.reply_text("Wallet tracking not enabled.")
             return
         
         args = context.args
         
-        if len(args) < 1:
+        if not args:
             await update.message.reply_text(
-                "Usage: `/track <wallet_address> [name]`",
+                "Usage: `/token <token_address>`",
                 parse_mode="Markdown",
             )
             return
         
         address = args[0]
-        name = args[1] if len(args) > 1 else "Unknown"
+        loading_msg = await update.message.reply_text("🔄 Fetching token info...")
         
-        # Validate address
-        if not WalletManager.is_valid_address(address):
-            await update.message.reply_text("❌ Invalid wallet address.")
+        try:
+            info = await self._token_service.get_token_info(address)
+            
+            if not info:
+                await loading_msg.edit_text(
+                    f"❌ Token not found.\n`{address}`",
+                    parse_mode="Markdown",
+                )
+                return
+            
+            message = self._token_service.format_token_message(info)
+            
+            await loading_msg.edit_text(
+                message,
+                parse_mode="Markdown",
+                reply_markup=build_token_action_menu(address, info.symbol),
+            )
+        except Exception as e:
+            logger.error("token_command_error", error=str(e))
+            await loading_msg.edit_text(f"❌ Error: {e}")
+    
+    # ==========================================
+    # LEGACY COMMANDS (for backwards compatibility)
+    # ==========================================
+    
+    async def cmd_pnl(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /pnl command."""
+        if not await self._check_admin(update):
             return
         
-        self.tracker.add_wallet(address, name)
+        stats = self._position_manager.get_stats()
         
+        message = f"""
+📈 **PnL Summary**
+
+**Total Positions:** {stats['total_positions']}
+**Open:** {stats['open_positions']}
+**Closed:** {stats['closed_positions']}
+
+**Wins (TP):** {stats['tp_wins']}
+**Losses (SL):** {stats['sl_losses']}
+**Win Rate:** {stats['win_rate']:.0f}%
+"""
         await update.message.reply_text(
-            f"✅ Now tracking wallet:\n"
-            f"**{name}**\n"
-            f"`{address}`",
+            message.strip(),
             parse_mode="Markdown",
         )
+    
+    async def cmd_slippage(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /slippage <bps> command."""
+        if not await self._check_admin(update):
+            return
+        
+        args = context.args
+        user_id = update.effective_user.id
+        
+        if not args:
+            settings = self._user_settings.get_settings(user_id)
+            await update.message.reply_text(
+                f"📊 **Slippage Settings**\n\n"
+                f"Current: **{settings.slippage_bps} bps** ({settings.slippage_bps/100}%)\n\n"
+                f"Usage: `/slippage <bps>`\n"
+                f"Example: `/slippage 300` for 3%",
+                parse_mode="Markdown",
+            )
+            return
+        
+        try:
+            slippage = int(args[0])
+            if slippage < 10 or slippage > 5000:
+                await update.message.reply_text("❌ Slippage must be 10-5000 bps")
+                return
+            
+            self._user_settings.update_settings(user_id, slippage_bps=slippage)
+            await update.message.reply_text(
+                f"✅ Slippage set to **{slippage} bps** ({slippage/100}%)",
+                parse_mode="Markdown",
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid slippage")
+    
+    async def cmd_stats(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /stats <address> - Wallet analysis."""
+        if not await self._check_admin(update):
+            return
+        
+        args = context.args
+        
+        if not args:
+            await update.message.reply_text(
+                "Usage: `/stats <wallet_address>`",
+                parse_mode="Markdown",
+            )
+            return
+        
+        address = args[0]
+        
+        if not WalletManager.is_valid_address(address):
+            await update.message.reply_text("❌ Invalid wallet address")
+            return
+        
+        loading_msg = await update.message.reply_text("🔄 Analyzing wallet...")
+        
+        try:
+            stats = await self._wallet_analyzer.analyze_wallet(address, limit=50)
+            message = self._wallet_analyzer.format_stats_message(stats)
+            
+            await loading_msg.edit_text(message, parse_mode="Markdown")
+        except Exception as e:
+            logger.error("stats_error", error=str(e))
+            await loading_msg.edit_text(f"❌ Error: {e}")
     
     async def cmd_untrack(
         self,
@@ -467,7 +984,7 @@ Use token mint addresses or search by symbol.
         
         args = context.args
         
-        if len(args) < 1:
+        if not args:
             await update.message.reply_text(
                 "Usage: `/untrack <wallet_address>`",
                 parse_mode="Markdown",
@@ -476,18 +993,14 @@ Use token mint addresses or search by symbol.
         
         address = args[0]
         self.tracker.remove_wallet(address)
-        
-        await update.message.reply_text(
-            f"✅ Stopped tracking: `{address[:8]}...`",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text(f"✅ Stopped tracking: `{address[:8]}...`", parse_mode="Markdown")
     
     async def cmd_activity(
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
-        """Handle /activity [address] command."""
+        """Handle /activity command."""
         if not await self._check_admin(update):
             return
         
@@ -497,571 +1010,32 @@ Use token mint addresses or search by symbol.
         
         args = context.args
         address = args[0] if args else None
-        
-        # Get recent activities
         activities = self.tracker.get_recent_activities(address=address, limit=10)
         
         if not activities:
-            if address:
-                await update.message.reply_text(
-                    f"No recent activity for wallet `{address[:8]}...`\n\n"
-                    "Make sure the wallet is being tracked with `/track`",
-                    parse_mode="Markdown",
-                )
-            else:
-                await update.message.reply_text(
-                    "No recent activity detected.\n\n"
-                    "Add wallets to track with `/track <address> [name]`",
-                    parse_mode="Markdown",
-                )
+            await update.message.reply_text("No recent activity.")
             return
         
-        message = "📜 **Recent Activity**\n\n"
+        message = "📋 **Recent Activity**\n\n"
         
-        for activity in activities:
-            timestamp = activity.timestamp.strftime("%H:%M:%S")
-            
-            if activity.swap_info:
-                swap = activity.swap_info
+        for act in activities:
+            time = act.timestamp.strftime("%H:%M:%S")
+            if act.swap_info:
+                swap = act.swap_info
                 direction = "🟢 BUY" if swap.direction.value == "buy" else "🔴 SELL"
-                
-                message += (
-                    f"**{activity.wallet_name}** ({timestamp})\n"
-                    f"{direction} | In: {swap.input_amount:.4f} → Out: {swap.output_amount:.4f}\n"
-                    f"[TX](https://solscan.io/tx/{activity.signature})\n\n"
-                )
-            else:
-                message += (
-                    f"**{activity.wallet_name}** ({timestamp})\n"
-                    f"Type: {activity.activity_type}\n"
-                    f"[TX](https://solscan.io/tx/{activity.signature})\n\n"
-                )
-        
-        await update.message.reply_text(
-            message.strip(),
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
-        )
-    
-    async def cmd_copy(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-    ) -> None:
-        """Handle /copy [status|enable|disable] command."""
-        if not await self._check_admin(update):
-            return
-        
-        if not self.copy_trader:
-            await update.message.reply_text("Copy trading not configured.")
-            return
-        
-        args = context.args
-        subcommand = args[0].lower() if args else "status"
-        
-        if subcommand == "status":
-            stats = self.copy_trader.get_stats()
-            enabled = self.settings.copy_trading.enabled
-            
-            message = f"""
-📋 **Copy Trading Status**
-
-**Status:** {"🟢 Enabled" if enabled else "🔴 Disabled"}
-**Tracked Wallets:** {len(self.settings.copy_trading.tracked_wallets)}
-
-**Statistics:**
-• Trades Detected: {stats['total_detected']}
-• Trades Copied: {stats['total_copied']}
-• Trades Skipped: {stats['total_skipped']}
-• Success Rate: {stats['success_rate']:.1f}%
-
-**Settings:**
-• Sizing Mode: {self.settings.copy_trading.sizing_mode}
-• Copy Percentage: {self.settings.copy_trading.copy_percentage}%
-• Delay: {self.settings.copy_trading.copy_delay_seconds}s
-"""
-            
-            await update.message.reply_text(
-                message.strip(),
-                parse_mode="Markdown",
-            )
-        
-        elif subcommand == "enable":
-            self.settings.copy_trading.enabled = True
-            await self.copy_trader.start()
-            await update.message.reply_text("✅ Copy trading enabled.")
-        
-        elif subcommand == "disable":
-            self.settings.copy_trading.enabled = False
-            await self.copy_trader.stop()
-            await update.message.reply_text("⏹️ Copy trading disabled.")
-        
-        else:
-            await update.message.reply_text(
-                "Usage: `/copy [status|enable|disable]`",
-                parse_mode="Markdown",
-            )
-    
-    async def cmd_pnl(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-    ) -> None:
-        """Handle /pnl [address] command."""
-        if not await self._check_admin(update):
-            return
-        
-        if not self.pnl_tracker:
-            await update.message.reply_text("PnL tracking not enabled.")
-            return
-        
-        args = context.args
-        
-        if args:
-            # Show PnL for specific wallet
-            address = args[0]
-            report = self.pnl_tracker.format_pnl_report(address)
-            await update.message.reply_text(report, parse_mode="Markdown")
-        else:
-            # Show summary of all wallets
-            wallets = self.pnl_tracker.get_all_wallets_pnl()
-            
-            if not wallets:
-                await update.message.reply_text("No PnL data available yet.")
-                return
-            
-            message = "📊 **PnL Summary**\n\n"
-            
-            for w in wallets[:10]:  # Top 10
-                emoji = "🟢" if w['total_pnl'] >= 0 else "🔴"
-                message += (
-                    f"{emoji} **{w['name']}**\n"
-                    f"   PnL: {w['total_pnl']:+.4f} SOL\n"
-                    f"   Win Rate: {w['win_rate']:.1f}%\n\n"
-                )
-            
-            await update.message.reply_text(
-                message.strip(),
-                parse_mode="Markdown",
-            )
-    
-    async def cmd_settings(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-    ) -> None:
-        """Handle /settings command."""
-        if not await self._check_admin(update):
-            return
-        
-        trading = self.settings.trading
-        risk = self.settings.risk
-        
-        message = f"""
-⚙️ **Current Settings**
-
-**Trading:**
-• Default Slippage: {trading.default_slippage_bps} bps ({trading.default_slippage_bps/100}%)
-• Max Slippage: {trading.max_slippage_bps} bps
-• Default Amount: {trading.default_amount_sol} SOL
-
-**Risk Management:**
-• Max Position: {risk.max_position_percentage}%
-• Daily Loss Limit: {risk.daily_loss_limit_sol} SOL
-• Confirm Above: {risk.confirm_above_sol} SOL
-
-**Copy Trading:**
-• Enabled: {self.settings.copy_trading.enabled}
-• Sizing Mode: {self.settings.copy_trading.sizing_mode}
-
-**Network:** {self.settings.network}
-"""
-        
-        await update.message.reply_text(
-            message.strip(),
-            parse_mode="Markdown",
-        )
-    
-    async def cmd_slippage(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-    ) -> None:
-        """Handle /slippage <bps> command."""
-        if not await self._check_admin(update):
-            return
-        
-        args = context.args
-        
-        if not args:
-            await update.message.reply_text(
-                f"Current slippage: {self.settings.trading.default_slippage_bps} bps\n"
-                f"Usage: `/slippage <bps>` (e.g., `/slippage 150` for 1.5%)",
-                parse_mode="Markdown",
-            )
-            return
-        
-        try:
-            new_slippage = int(args[0])
-        except ValueError:
-            await update.message.reply_text("❌ Invalid value. Use an integer (basis points).")
-            return
-        
-        if new_slippage > self.settings.trading.max_slippage_bps:
-            await update.message.reply_text(
-                f"❌ Exceeds max slippage ({self.settings.trading.max_slippage_bps} bps)."
-            )
-            return
-        
-        self.settings.trading.default_slippage_bps = new_slippage
-        
-        await update.message.reply_text(
-            f"✅ Slippage set to {new_slippage} bps ({new_slippage/100}%)"
-        )
-    
-    async def cmd_stats(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-    ) -> None:
-        """Handle /stats <address> command - analyze wallet history."""
-        if not await self._check_admin(update):
-            return
-        
-        args = context.args
-        
-        if not args:
-            await update.message.reply_text(
-                "📊 **Wallet Stats**\n\n"
-                "Analyze any wallet's trading history.\n\n"
-                "Usage: `/stats <wallet_address>`\n\n"
-                "Example:\n"
-                "`/stats 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU`",
-                parse_mode="Markdown",
-            )
-            return
-        
-        address = args[0]
-        
-        # Validate address
-        if not WalletManager.is_valid_address(address):
-            await update.message.reply_text("❌ Invalid wallet address.")
-            return
-        
-        # Send loading message
-        loading_msg = await update.message.reply_text(
-            f"🔄 **Analyzing wallet...**\n\n"
-            f"`{address[:8]}...{address[-4:]}`\n\n"
-            f"_Fetching historical trades..._",
-            parse_mode="Markdown",
-        )
-        
-        try:
-            # Analyze wallet
-            stats = await self._wallet_analyzer.analyze_wallet(address, limit=50)
-            
-            # Format and send results
-            message = self._wallet_analyzer.format_stats_message(stats)
-            
-            await loading_msg.edit_text(
-                message,
-                parse_mode="Markdown",
-            )
-            
-        except Exception as e:
-            logger.error("stats_command_error", error=str(e))
-            await loading_msg.edit_text(f"❌ Error analyzing wallet: {e}")
-    
-    async def cmd_token(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-    ) -> None:
-        """Handle /token <address> command - get token info."""
-        if not await self._check_admin(update):
-            return
-        
-        args = context.args
-        
-        if not args:
-            await update.message.reply_text(
-                "🪙 **Token Info**\n\n"
-                "Get comprehensive info about any token.\n\n"
-                "Usage: `/token <token_address>`\n\n"
-                "Example:\n"
-                "`/token EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`",
-                parse_mode="Markdown",
-            )
-            return
-        
-        address = args[0]
-        
-        # Validate address (basic check)
-        if len(address) < 32 or len(address) > 50:
-            await update.message.reply_text("❌ Invalid token address.")
-            return
-        
-        # Send loading message
-        loading_msg = await update.message.reply_text(
-            f"🔄 **Fetching token info...**\n\n"
-            f"`{address[:8]}...{address[-4:]}`\n\n"
-            f"_Getting price, market cap, liquidity..._",
-            parse_mode="Markdown",
-        )
-        
-        try:
-            # Get token info
-            info = await self._token_service.get_token_info(address)
-            
-            if not info:
-                await loading_msg.edit_text(
-                    f"❌ Token not found or no trading data.\n\n"
-                    f"Address: `{address}`\n\n"
-                    f"Make sure this is a valid SPL token with trading activity.",
-                    parse_mode="Markdown",
-                )
-                return
-            
-            # Format and send results
-            message = self._token_service.format_token_message(info)
-            
-            # Add buy/sell buttons
-            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-            
-            keyboard = [
-                [
-                    InlineKeyboardButton("🟢 Buy 0.1 SOL", callback_data=f"quickbuy_{address[:20]}_0.1"),
-                    InlineKeyboardButton("🟢 Buy 0.5 SOL", callback_data=f"quickbuy_{address[:20]}_0.5"),
-                ],
-                [
-                    InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_token_{address[:20]}"),
-                    InlineKeyboardButton("📊 Chart", url=f"https://dexscreener.com/solana/{address}"),
-                ],
-            ]
-            
-            await loading_msg.edit_text(
-                message,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown",
-            )
-            
-        except Exception as e:
-            logger.error("token_command_error", error=str(e))
-            await loading_msg.edit_text(f"❌ Error fetching token info: {e}")
-    
-    async def cmd_limit(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-    ) -> None:
-        """Handle /limit command - create limit orders."""
-        if not await self._check_admin(update):
-            return
-        
-        args = context.args
-        
-        if not args or len(args) < 4:
-            await update.message.reply_text(
-                "📋 **Limit Orders**\n\n"
-                "Create buy/sell orders at specific prices.\n\n"
-                "**Usage:**\n"
-                "`/limit buy <token> <price_usd> <sol_amount>`\n"
-                "`/limit sell <token> <price_usd> <sol_amount>`\n"
-                "`/limit sl <token> <price_usd> <sol_amount>` (Stop Loss)\n"
-                "`/limit tp <token> <price_usd> <sol_amount>` (Take Profit)\n\n"
-                "**Examples:**\n"
-                "`/limit buy BONK 0.00002 0.5`\n"
-                "_Buy BONK when price drops to $0.00002, spend 0.5 SOL_\n\n"
-                "`/limit sl BONK 0.00001 100000`\n"
-                "_Sell 100k BONK if price drops to $0.00001_\n\n"
-                "**Other Commands:**\n"
-                "• `/orders` - View all orders\n"
-                "• `/cancelorder <id>` - Cancel an order",
-                parse_mode="Markdown",
-            )
-            return
-        
-        order_type_str = args[0].lower()
-        token_input = args[1]
-        
-        try:
-            target_price = float(args[2])
-            amount = float(args[3])
-        except ValueError:
-            await update.message.reply_text("❌ Invalid price or amount. Use numbers.")
-            return
-        
-        # Determine order type
-        type_map = {
-            "buy": OrderType.LIMIT_BUY,
-            "sell": OrderType.LIMIT_SELL,
-            "sl": OrderType.STOP_LOSS,
-            "stoploss": OrderType.STOP_LOSS,
-            "tp": OrderType.TAKE_PROFIT,
-            "takeprofit": OrderType.TAKE_PROFIT,
-        }
-        
-        order_type = type_map.get(order_type_str)
-        if not order_type:
-            await update.message.reply_text(
-                f"❌ Unknown order type: {order_type_str}\n"
-                "Use: buy, sell, sl (stop loss), tp (take profit)"
-            )
-            return
-        
-        # Resolve token address
-        if len(token_input) > 30:
-            # It's an address
-            token_address = token_input
-            token_symbol = token_input[:8]
-        else:
-            # It's a symbol - need to search
-            await update.message.reply_text(
-                f"🔍 Searching for token: {token_input}..."
-            )
-            
-            results = await self._token_service.search_token(token_input)
-            if not results:
-                await update.message.reply_text(
-                    f"❌ Token not found: {token_input}\n\n"
-                    "Use the full token address instead."
-                )
-                return
-            
-            # Use first match
-            token_address = results[0].address
-            token_symbol = results[0].symbol
-        
-        # Get current price for reference
-        token_info = await self._token_service.get_token_info(token_address)
-        current_price = token_info.price_usd if token_info else 0
-        
-        # Create the order
-        order = self._limit_service.create_order(
-            order_type=order_type,
-            token_address=token_address,
-            token_symbol=token_symbol,
-            target_price_usd=target_price,
-            amount_sol=amount,
-            expires_hours=24,  # 24 hour expiry
-        )
-        
-        # Format response
-        type_emoji = {
-            OrderType.LIMIT_BUY: "🟢 Limit Buy",
-            OrderType.LIMIT_SELL: "🔴 Limit Sell",
-            OrderType.STOP_LOSS: "🛑 Stop Loss",
-            OrderType.TAKE_PROFIT: "🎯 Take Profit",
-        }
-        
-        price_diff = ""
-        if current_price > 0:
-            diff_pct = ((target_price - current_price) / current_price) * 100
-            price_diff = f"\n📈 Current: ${current_price:.8f} ({diff_pct:+.2f}%)"
-        
-        message = f"""
-✅ **Limit Order Created**
-
-**Order ID:** `{order.id}`
-**Type:** {type_emoji.get(order_type, order_type.value)}
-
-**Token:** {token_symbol}
-**Target Price:** ${target_price:.8f}{price_diff}
-**Amount:** {amount} SOL
-
-⏰ **Expires:** 24 hours
-
-The bot will automatically execute when price reaches target.
-
-Use `/orders` to view all orders.
-Use `/cancelorder {order.id}` to cancel.
-"""
-        
-        await update.message.reply_text(message.strip(), parse_mode="Markdown")
-        
-        # Start limit order service if not running
-        if not self._limit_service._running:
-            await self._limit_service.start()
-    
-    async def cmd_orders(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-    ) -> None:
-        """Handle /orders command - view limit orders."""
-        if not await self._check_admin(update):
-            return
-        
-        orders = self._limit_service.get_all_orders()
-        
-        if not orders:
-            await update.message.reply_text(
-                "📋 **No Limit Orders**\n\n"
-                "You have no limit orders.\n\n"
-                "Create one with:\n"
-                "`/limit buy <token> <price> <amount>`",
-                parse_mode="Markdown",
-            )
-            return
-        
-        # Group by status
-        pending = [o for o in orders if o.status == OrderStatus.PENDING]
-        filled = [o for o in orders if o.status == OrderStatus.FILLED]
-        other = [o for o in orders if o.status not in [OrderStatus.PENDING, OrderStatus.FILLED]]
-        
-        message = "📋 **Your Limit Orders**\n\n"
-        
-        if pending:
-            message += "**⏳ Pending:**\n"
-            for o in pending[:5]:
-                type_emoji = "🟢" if "buy" in o.order_type.value else "🔴"
-                message += f"• `{o.id}` {type_emoji} {o.token_symbol} @ ${o.target_price_usd:.6f}\n"
-            message += "\n"
-        
-        if filled:
-            message += "**✅ Filled (Recent):**\n"
-            for o in filled[:3]:
-                type_emoji = "🟢" if "buy" in o.order_type.value else "🔴"
-                message += f"• `{o.id}` {type_emoji} {o.token_symbol}\n"
-            message += "\n"
-        
-        if other:
-            message += "**Other:**\n"
-            for o in other[:3]:
-                status = "❌" if o.status == OrderStatus.CANCELLED else "💥" if o.status == OrderStatus.FAILED else "⏰"
-                message += f"• `{o.id}` {status} {o.token_symbol}\n"
-        
-        message += f"\n_Total: {len(orders)} orders_"
+                message += f"**{act.wallet_name}** ({time})\n{direction}\n\n"
         
         await update.message.reply_text(message.strip(), parse_mode="Markdown")
     
-    async def cmd_cancelorder(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-    ) -> None:
-        """Handle /cancelorder <id> command."""
-        if not await self._check_admin(update):
-            return
-        
-        args = context.args
-        
-        if not args:
-            await update.message.reply_text(
-                "Usage: `/cancelorder <order_id>`\n\n"
-                "Use `/orders` to see order IDs.",
-                parse_mode="Markdown",
-            )
-            return
-        
-        order_id = args[0]
-        
-        if self._limit_service.cancel_order(order_id):
-            await update.message.reply_text(f"✅ Order `{order_id}` cancelled.", parse_mode="Markdown")
-        else:
-            await update.message.reply_text(
-                f"❌ Could not cancel order `{order_id}`.\n\n"
-                "Order may not exist or is already filled/cancelled.",
-                parse_mode="Markdown",
-            )
-
+    # Keep position manager reference for external access
+    @property
+    def position_manager(self) -> PositionManager:
+        return self._position_manager
+    
+    @property
+    def user_settings(self) -> UserSettingsManager:
+        return self._user_settings
+    
+    @property  
+    def token_service(self) -> TokenInfoService:
+        return self._token_service

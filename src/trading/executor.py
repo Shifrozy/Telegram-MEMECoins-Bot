@@ -2,6 +2,7 @@
 Trade executor for the Solana Trading Bot.
 
 Orchestrates the full trade flow from order creation through execution.
+Now supports both Jupiter (standard tokens) and PumpPortal (pump.fun tokens).
 """
 
 import base64
@@ -15,20 +16,24 @@ from src.config.settings import Settings
 from src.blockchain.wallet import WalletManager
 from src.trading.jupiter import JupiterClient, QuoteResponse, ExecuteResponse, JupiterError
 from src.trading.models import TradeOrder, TradeResult, TradeStatus, TradeSource
+from src.trading.pumpportal import PumpPortalClient, is_pump_token
 
 logger = get_logger(__name__)
 
 
 class TradeExecutor:
     """
-    Executes trades on Solana DEXs via Jupiter.
+    Executes trades on Solana DEXs.
+    
+    Supports:
+    - Jupiter Ultra API for standard tokens
+    - PumpPortal API for pump.fun tokens
     
     Handles the complete flow:
-    1. Get quote from Jupiter
-    2. Sign transaction with wallet
-    3. Execute via Jupiter Ultra
-    4. Poll for confirmation
-    5. Return result
+    1. Detect token type (pump.fun or standard)
+    2. Get quote from appropriate API
+    3. Sign transaction with wallet
+    4. Execute and confirm
     """
     
     def __init__(
@@ -49,6 +54,23 @@ class TradeExecutor:
         self.jupiter = jupiter
         self.wallet = wallet
         
+        # Initialize PumpPortal client for pump.fun bonding curve tokens
+        self.pumpportal = PumpPortalClient(
+            keypair=wallet.keypair,
+            timeout=30,
+        )
+        
+        # Initialize Jupiter V6 client for broader token support (Raydium, etc.)
+        from src.trading.jupiter_v6 import JupiterV6Client
+        self.jupiter_v6 = JupiterV6Client(
+            keypair=wallet.keypair,
+            rpc_url=settings.solana_rpc_url,
+            timeout=30,
+        )
+        
+        # Dry run mode - simulate trades without executing
+        self.dry_run = settings.dry_run
+        
         # Trade callbacks
         self._on_trade_submitted: Optional[Callable[[TradeOrder], Awaitable[None]]] = None
         self._on_trade_completed: Optional[Callable[[TradeResult], Awaitable[None]]] = None
@@ -57,6 +79,7 @@ class TradeExecutor:
         self._total_trades = 0
         self._successful_trades = 0
         self._failed_trades = 0
+        self._simulated_trades = 0
     
     def on_trade_submitted(
         self,
@@ -319,6 +342,11 @@ class TradeExecutor:
         """
         Buy a token with SOL.
         
+        Automatically detects token type and uses the best API:
+        1. PumpPortal for pump.fun bonding curve tokens
+        2. Jupiter V6 for Raydium/graduated tokens
+        3. Jupiter Ultra for standard tokens
+        
         Args:
             token_mint: Token to buy
             amount_sol: Amount of SOL to spend
@@ -327,13 +355,114 @@ class TradeExecutor:
         Returns:
             TradeResult
         """
-        sol_mint = "So11111111111111111111111111111111111111112"
-        return await self.quick_swap(
-            input_mint=sol_mint,
-            output_mint=token_mint,
-            amount_sol=amount_sol,
-            slippage_bps=slippage_bps,
+        self._total_trades += 1
+        slippage = slippage_bps or self.settings.trading.default_slippage_bps
+        
+        # DRY RUN MODE - simulate trade without executing
+        if self.dry_run:
+            self._simulated_trades += 1
+            logger.info(
+                "dry_run_buy",
+                token=token_mint[:8] + "...",
+                amount_sol=amount_sol,
+            )
+            
+            # Simulate getting a quote
+            import random
+            simulated_tokens = int(amount_sol * random.uniform(1000000, 10000000))
+            
+            return TradeResult(
+                order_id=f"DRY_RUN_{self._simulated_trades}",
+                order=None,
+                status=TradeStatus.CONFIRMED,
+                signature="DRY_RUN_SIMULATED_TX_" + token_mint[:16],
+                input_amount=int(amount_sol * 1_000_000_000),
+                output_amount=simulated_tokens,
+            )
+        
+        # Check if it's a pump.fun token
+        if is_pump_token(token_mint):
+            logger.info(
+                "trying_pumpportal",
+                action="buy",
+                token=token_mint[:8] + "...",
+                amount=amount_sol,
+            )
+            
+            # Try PumpPortal first (for tokens still on bonding curve)
+            pump_slippage = max(slippage // 100, 10)  # Minimum 10% for pump tokens
+            result = await self.pumpportal.buy(
+                mint=token_mint,
+                amount_sol=amount_sol,
+                slippage=pump_slippage,
+            )
+            
+            if result.success:
+                self._successful_trades += 1
+                return TradeResult(
+                    order_id="pump_" + (result.signature[:8] if result.signature else "ok"),
+                    order=None,
+                    status=TradeStatus.CONFIRMED,
+                    signature=result.signature,
+                    input_amount=int(amount_sol * 1_000_000_000),
+                    output_amount=0,
+                )
+            
+            # PumpPortal failed - token might be graduated to Raydium
+            # Try Jupiter V6 (supports Raydium pools)
+            logger.info(
+                "pumpportal_failed_trying_jupiter_v6",
+                error=result.error,
+                token=token_mint[:8] + "...",
+            )
+        
+        # Try Jupiter V6 (supports more tokens including Raydium)
+        logger.info(
+            "trying_jupiter_v6",
+            token=token_mint[:8] + "...",
+            amount=amount_sol,
         )
+        
+        v6_result = await self.jupiter_v6.buy_token(
+            token_mint=token_mint,
+            amount_sol=amount_sol,
+            slippage_bps=max(slippage, 100),  # Minimum 1% for memecoins
+        )
+        
+        if v6_result.success:
+            self._successful_trades += 1
+            return TradeResult(
+                order_id="v6_" + (v6_result.signature[:8] if v6_result.signature else "ok"),
+                order=None,
+                status=TradeStatus.CONFIRMED,
+                signature=v6_result.signature,
+                input_amount=v6_result.input_amount,
+                output_amount=v6_result.output_amount,
+            )
+        
+        # Jupiter V6 also failed - try Jupiter Ultra as last resort
+        logger.info(
+            "jupiter_v6_failed_trying_ultra",
+            error=v6_result.error,
+            token=token_mint[:8] + "...",
+        )
+        
+        sol_mint = "So11111111111111111111111111111111111111112"
+        try:
+            return await self.quick_swap(
+                input_mint=sol_mint,
+                output_mint=token_mint,
+                amount_sol=amount_sol,
+                slippage_bps=slippage,
+            )
+        except Exception as e:
+            self._failed_trades += 1
+            return TradeResult(
+                order_id="failed",
+                order=None,
+                status=TradeStatus.FAILED,
+                error=f"All swap methods failed. Last error: {str(e)[:100]}",
+            )
     
     async def sell_token(
         self,
